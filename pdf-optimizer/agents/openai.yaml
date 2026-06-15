@@ -1,0 +1,8 @@
+# Optional Codex sidecar: UI metadata for the skill list.
+# The SKILL.md frontmatter (name/description) remains the source of truth for
+# triggering; this only customizes how the skill is presented in Codex.
+name: pdf-optimizer
+display_name: PDF Optimizer (email & fax)
+description: >-
+  Channel-aware PDF optimization — shrink for email/web, or convert to a
+  fax-ready 1-bit CCITT-G4 PDF/TIFF that survives Group-3 transmission.

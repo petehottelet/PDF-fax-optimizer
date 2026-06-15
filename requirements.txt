@@ -1,0 +1,12 @@
+# Python dependencies for the pdf-optimizer skill.
+# Install with:  pip install -r requirements.txt
+#
+# The qpdf CLI is also required (for lossless structural optimization and
+# linearization) and Ghostscript is optional. Install those with your system
+# package manager — see README.md.
+
+PyMuPDF>=1.24        # fitz: rasterize pages, enumerate embedded images
+Pillow>=10.0         # threshold/dither + CCITT-G4 TIFF I/O
+numpy>=1.26          # array math for halftoning / pre-cleaning
+opencv-python-headless>=4.9  # morphology, deskew, segmentation
+img2pdf>=0.5         # embed the G4 TIFF into a PDF without re-encoding

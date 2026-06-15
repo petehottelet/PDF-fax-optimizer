@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+
+# Tooling / editors
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Generated optimizer artifacts (don't commit sample outputs)
+*.fax.pdf
+*.fax.tiff
+*.report.json
+*.preview_p*.png
+intake.fax.preview_p1.png
+
+# Packaged skill bundle (distribute as a GitHub Release asset, not in source)
+*.skill
+*.zip
+
+# Local working / design assets (not part of the published skill)
+00_Project_Files/
