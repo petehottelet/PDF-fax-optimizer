@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/banner.png" alt="Fax PDF — maximize document quality over any fax line" width="100%">
+</p>
+
 # PDF Optimizer — an Agent Skill for email & fax
 
 A portable [Agent Skill](https://www.anthropic.com/news/skills) that teaches an
