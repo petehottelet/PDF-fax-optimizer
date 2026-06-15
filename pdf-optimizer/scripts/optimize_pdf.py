@@ -178,8 +178,9 @@ def main():
     p.add_argument("--fax-resolution",
                    choices=["standard", "fine", "superfine"], default=None)
     p.add_argument("--dither",
-                   choices=["auto", "floyd", "atkinson", "ordered",
-                            "clustered", "none"], default=None)
+                   choices=["auto", "none", "threshold", "ordered", "bayer",
+                            "clustered", "floyd", "atkinson", "jarvis", "stucki",
+                            "sierra", "blue-noise"], default=None)
     p.add_argument("--fax-heavy", action="store_true")
     p.add_argument("--segmentation",
                    choices=["embedded", "variance", "none"], default=None)
@@ -193,6 +194,12 @@ def main():
     p.add_argument("--format", choices=["pdf", "tiff"], default=None)
     p.add_argument("--line-rate", type=int, default=None)
     p.add_argument("--preview-page", type=int, default=None)
+    p.add_argument("--compare-page", type=int, default=None,
+                   help="render this page through several halftone methods into "
+                        "one labeled contact sheet so you can pick by eye")
+    p.add_argument("--compare-methods", default=None,
+                   help="comma-separated halftone names for --compare-page "
+                        "(default: the curated top 5)")
     args = p.parse_args()
 
     cfg = load_config(args.config)
@@ -200,11 +207,30 @@ def main():
 
     if mode == "fax":
         opt = build_fax_options(cfg, args)
+        comparison = None
+        if args.compare_page:
+            methods = ([m.strip() for m in args.compare_methods.split(",")]
+                       if args.compare_methods else None)
+            png = (os.path.splitext(args.output)[0]
+                   + f".compare_p{args.compare_page}.png")
+            comparison = fax.render_comparison(
+                args.input, args.compare_page, png, opt, methods)
+            print(f"Comparison contact sheet: {png}")
+            print(f"  recommended: {comparison['recommended']}  "
+                  f"(smallest: {comparison['smallest']})")
+            print(f"  why: {comparison['reason']}")
+            print("  spend your eye tokens \u2014 per-method G4 size / page:")
+            for m, mm in comparison["methods"].items():
+                star = "  <- recommended" if m == comparison["recommended"] else ""
+                print(f"    {m:11s} {mm['encoded_bytes'] / 1024:6.0f} KB  "
+                      f"~{mm['est_transmission_s']:.0f}s{star}")
         if args.preview_page:
             png = os.path.splitext(args.output)[0] + f".preview_p{args.preview_page}.png"
             fax.render_preview(args.input, args.preview_page, png, opt)
             print(f"Preview written: {png}")
         report = fax.convert_pdf(args.input, args.output, opt)
+        if comparison:
+            report["comparison"] = comparison
     elif mode == "size-lossless":
         lin = args.linearize if args.linearize is not None else \
             cfg.get("size", {}).get("linearize", True)
@@ -243,8 +269,13 @@ def _print_summary(report):
     print(f"output: {ob:,} bytes  ({size_note})")
     if report["mode"] == "fax":
         print(f"pages:  {len(report['pages'])}")
+        dithers = sorted({p.get("dither", "") for p in report["pages"]} - {""})
+        if dithers:
+            print(f"halftone used: {', '.join(dithers)}")
         print(f"est. transmission: {report['total_est_transmission_s']:.0f}s "
               f"(~{report['total_est_transmission_s']/60:.1f} min)")
+        if report.get("comparison"):
+            print(f"comparison sheet: {report['comparison']['output']}")
         if report["warnings"]:
             print("warnings: " + ", ".join(report["warnings"]))
     elif report["mode"] == "size":

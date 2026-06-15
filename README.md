@@ -35,13 +35,46 @@ compatible agents.
   204×196, `superfine` 204×391), resampling axes independently and clamping the
   scanline to 1728 px.
 - MRC-lite segmentation using the PDF's embedded-image rectangles: text/line-art
-  → hard threshold; photos → halftone (Floyd, Atkinson, ordered, or clustered).
+  → hard threshold; photos → halftone.
 - Pre-cleans: background flatten, despeckle, deskew; optional stroke thickening
   to save hairlines and small fonts.
 - Emits lossless CCITT-G4 (no re-encode) via img2pdf; qpdf linearizes the result.
 - Produces a JSON report with **estimated transmission time per page** and
   legibility/inversion warnings, plus a `--preview-page` PNG of exactly what
   will be transmitted.
+
+## Halftone methods + the "eye tokens" comparison preview
+
+A continuous-tone photo can't exist in 1-bit fax — it has to be simulated with
+dot patterns, and that choice is the biggest lever on how a photo reads after a
+lossy transmission. The skill ships the **top 5 halftoning technologies**,
+spanning the design space:
+
+| `--dither` | Family | Detail | G4 size | Noise robustness |
+|---|---|---|---|---|
+| `clustered` | AM screening (clustered-dot) | low–med | **best** | **best** |
+| `blue-noise` | FM screening (void-and-cluster) | **high** | medium | medium |
+| `atkinson` | error diffusion (6/8) | high | med | low–med |
+| `floyd` | error diffusion | **highest** | **worst** | **worst** |
+| `ordered` | ordered (Bayer) | medium | medium | medium |
+
+(`jarvis`, `stucki`, `sierra`, and `none`/threshold are also selectable.)
+
+Compression can be ranked by a machine, but **readability can't** — only a human
+eye can decide whether a halftone "reads." So `--compare-page N` renders one page
+through all five methods into a single labeled **contact sheet**, each panel
+annotated with its real G4 size and transmission estimate, with the recommended
+pick highlighted. The skill **suggests the optimal** method from the page's
+content, and you **choose the optimal** by spending your *eye tokens* on the
+contact sheet — then re-run with the chosen `--dither` for the final file.
+
+```bash
+python pdf-optimizer/scripts/optimize_pdf.py input.pdf -o output.fax.pdf \
+    --mode fax --fax-resolution fine --compare-page 1
+# -> writes output.fax.compare_p1.png (a side-by-side of all 5 methods)
+```
+
+![Example halftone comparison contact sheet](docs/compare_example.png)
 
 ## Repository layout
 

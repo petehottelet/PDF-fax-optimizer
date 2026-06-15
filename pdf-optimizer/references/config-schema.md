@@ -21,8 +21,9 @@ omitted keys fall back to the documented defaults.
   // ---- fax mode ----
   "fax": {
     "resolution": "fine",         // "standard" | "fine" | "superfine"
-    "dither": "auto",             // "auto" | "floyd" | "atkinson"
-                                  //   | "ordered" | "clustered" | "none"
+    "dither": "auto",             // "auto" | "clustered" | "blue-noise"
+                                  //   | "atkinson" | "floyd" | "ordered"
+                                  //   | "jarvis" | "stucki" | "sierra" | "none"
     "fax_heavy": false,           // bias toward clustered (compresses, robust)
     "segmentation": "embedded",   // "embedded" (use PDF image rects)
                                   //   | "variance" (heuristic for flat scans)
@@ -41,6 +42,9 @@ omitted keys fall back to the documented defaults.
   "preview_page": null            // 1-based page number to render as PNG, or null
 }
 ```
+
+> Note: `--compare-page N` and `--compare-methods a,b,c` (the multi-method
+> "eye tokens" contact sheet) are CLI-only flags, not config keys.
 
 ## Annotated example — faxing scanned clinical paperwork with a photo
 
@@ -80,6 +84,8 @@ The `report` file (and `--report`) is written as JSON:
       "encoded_bytes": 61220,
       "est_transmission_s": 35.5,
       "photo_regions": 1,
+      "photo_fraction": 0.19,
+      "dither": "atkinson",
       "already_bilevel": false,
       "warnings": ["small_text_below_min", "wash_out_color:yellow"]
     }

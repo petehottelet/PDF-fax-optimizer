@@ -103,9 +103,8 @@ What the pipeline does, per page (details in the reference):
 3. **Pre-clean:** flatten near-white backgrounds to pure white (so faint content
    survives thresholding), despeckle isolated black pixels, and deskew.
 4. **Halftone the photo regions** with the chosen algorithm. `--dither auto`
-   picks per the fidelity/compression trade-off; override with
-   `clustered` (best compression, survives noisy lines), `floyd`/`atkinson`
-   (best detail, worst compression), or `ordered`.
+   picks per the fidelity/compression trade-off; override with any of the
+   methods in *Halftone methods* below.
 5. **Defend legibility:** optionally thicken hairline strokes and sub-minimum
    fonts that would vanish at low DPI; warn on inverted (white-on-black) regions
    that balloon transmission time.
@@ -116,17 +115,55 @@ What the pipeline does, per page (details in the reference):
    size), total pages, and any legibility/inversion warnings, so the result is
    inspectable *before* someone faxes something unreadable.
 
-### Choosing the dither (the non-obvious call)
+### Halftone methods (the top 5)
 
-`references/fax-optimization.md` covers this in full, but the headline:
+A continuous-tone photo can't exist in 1-bit fax; it must be *simulated* with
+patterns of black dots. The method chosen is the single biggest lever on how a
+photo reads after transmission, and each sits at a different point on the
+**fidelity ↔ transition-density** curve (transitions = compression cost = line
+fragility). The skill ships five, spanning the design space (full theory in
+`references/fax-optimization.md`):
 
-- **Clustered-dot / ordered** halftone compresses far better and survives a
-  noisy line — at the cost of apparent resolution. Default for `--fax-heavy`.
-- **Error diffusion** (Floyd-Steinberg, Atkinson) gives the best perceived
-  photo detail but produces dispersed high-frequency speckle — the *worst case*
-  for run-length compression and the most fragile over a bad line.
-- Match the screen frequency to the fax resolution, or the halftone collapses to
-  mud when the receiving machine re-thresholds.
+1. **`clustered`** — clustered-dot AM screening (newsprint). Dots grow in
+   clusters → long runs → **best G4 compression and most robust over a noisy
+   line**; lowest apparent resolution. The default for `--fax-heavy`.
+2. **`blue-noise`** — void-and-cluster FM screening. Isotropic, organic stipple
+   with **no directional "worms"**; excellent perceived detail, middling
+   compression.
+3. **`atkinson`** — Atkinson error diffusion. Clean whites and crisp thin
+   features; good detail, looser compression than screening.
+4. **`floyd`** — Floyd–Steinberg error diffusion. The classic; **maximum
+   detail**, but its dispersed speckle is the **worst case for G4 size** and the
+   most fragile over a bad line.
+5. **`ordered`** — Bayer ordered dithering. Fast and predictable crosshatch;
+   middling on both detail and compression.
+
+(Also selectable: `jarvis`, `stucki`, `sierra` heavier error-diffusion kernels,
+and `none` = hard threshold for pure text / line art / barcodes.) Always match
+the screen to the fax resolution, or the halftone collapses to mud when the
+receiver re-thresholds — the pipeline scales the clustered cell from the dpi.
+
+### Maximally productive preview — let the user spend their *eye tokens*
+
+Algorithms can rank compression objectively, but **only a human eye can judge
+"does this read?"** So don't just pick silently — generate a side-by-side
+**comparison contact sheet** and let the user spend their *eye tokens* on the
+real, encoded output:
+
+```bash
+python3 scripts/optimize_pdf.py INPUT.pdf -o OUTPUT.pdf --mode fax \
+    --fax-resolution fine --compare-page 1 --report OUTPUT.report.json
+```
+
+`--compare-page N` renders that page through all five halftone methods into one
+labeled PNG (`OUTPUT.compare_pN.png`), each panel annotated with its **actual
+G4 size and estimated transmission time**, and the **OPTIMAL pick highlighted**.
+The skill therefore does both jobs the user asked for: (a) it **suggests the
+optimal** method from the page's content (photo fraction, fax-heavy, line
+condition), and (b) it lets the user **choose the optimal** by eye from the
+contact sheet. Offer this whenever a fax has meaningful photo content — then
+re-run with the chosen `--dither` for the final file. (Use `--compare-methods`
+to override which methods appear.)
 
 ### Special content checks
 
@@ -145,12 +182,18 @@ Instead of flags, pass `--config config.json`. Schema and an annotated example:
 
 Always finish by telling the user the output path(s), the before/after size (or
 for fax, total pages + estimated transmission time), and any warnings the report
-flagged. For fax jobs, **legibility is the acceptance test**: always offer to
-render a **preview** of the actual bilevel output (`--preview-page N` writes a
-PNG of exactly what will be transmitted) so they can confirm it's readable
-before sending. If anything is borderline — small text, faint signatures,
-muddy photos — recommend the knob that recovers it (`--thicken`, a higher
-`--fax-resolution`, or a cleaner dither) rather than shipping an unreadable fax.
+flagged. For fax jobs, **legibility is the acceptance test**:
+
+- For a single rendering, offer a **preview** of the actual bilevel output
+  (`--preview-page N` writes a PNG of exactly what will be transmitted).
+- When there's real photo content, offer the **comparison contact sheet**
+  (`--compare-page N`) so the user can spend their *eye tokens* and pick the
+  halftone that reads best — the skill highlights its recommended/optimal pick,
+  but the human makes the call.
+
+If anything is borderline — small text, faint signatures, muddy photos —
+recommend the knob that recovers it (`--thicken`, a higher `--fax-resolution`,
+or a different `--dither`) rather than shipping an unreadable fax.
 
 ## Reference files
 

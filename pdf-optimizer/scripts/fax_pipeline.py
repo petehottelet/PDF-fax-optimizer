@@ -62,6 +62,8 @@ class PageReport:
     encoded_bytes: int = 0
     est_transmission_s: float = 0.0
     photo_regions: int = 0
+    photo_fraction: float = 0.0
+    dither: str = ""
     already_bilevel: bool = False
     warnings: list = field(default_factory=list)
 
@@ -206,25 +208,56 @@ def threshold_otsu(gray: np.ndarray) -> np.ndarray:
 
 
 def dither_floyd(gray: np.ndarray) -> np.ndarray:
+    """Floyd-Steinberg via Pillow's fast C implementation."""
     return np.asarray(Image.fromarray(gray, "L").convert("1")).astype(np.uint8) * 255
 
 
-def dither_atkinson(gray: np.ndarray) -> np.ndarray:
-    """Atkinson error diffusion: diffuses 6/8 of the error, cleaner whites and
-    better thin-feature survival than Floyd-Steinberg, slightly better runs."""
+# Error-diffusion kernels as (divisor, [(dy, dx, weight), ...]). Atkinson
+# deliberately diffuses only 6/8 of the error (cleaner whites, less speckle).
+ED_KERNELS = {
+    "atkinson": (8, [(0, 1, 1), (0, 2, 1),
+                     (1, -1, 1), (1, 0, 1), (1, 1, 1),
+                     (2, 0, 1)]),
+    "jarvis": (48, [(0, 1, 7), (0, 2, 5),
+                    (1, -2, 3), (1, -1, 5), (1, 0, 7), (1, 1, 5), (1, 2, 3),
+                    (2, -2, 1), (2, -1, 3), (2, 0, 5), (2, 1, 3), (2, 2, 1)]),
+    "stucki": (42, [(0, 1, 8), (0, 2, 4),
+                    (1, -2, 2), (1, -1, 4), (1, 0, 8), (1, 1, 4), (1, 2, 2),
+                    (2, -2, 1), (2, -1, 2), (2, 0, 4), (2, 1, 2), (2, 2, 1)]),
+    "sierra": (32, [(0, 1, 5), (0, 2, 3),
+                    (1, -2, 2), (1, -1, 4), (1, 0, 5), (1, 1, 4), (1, 2, 2),
+                    (2, -1, 2), (2, 0, 3), (2, 1, 2)]),
+}
+
+
+def error_diffuse(gray: np.ndarray, kernel: str) -> np.ndarray:
+    """Generic serpentine error diffusion for the named kernel (see ED_KERNELS).
+
+    Serpentine (boustrophedon) scanning alternates row direction, which breaks
+    up the directional "worm" artifacts that a one-way raster produces.
+    """
+    div, taps = ED_KERNELS[kernel]
     img = gray.astype(np.float32)
     h, w = img.shape
     for y in range(h):
-        for x in range(w):
+        if y % 2 == 0:
+            xs, flip = range(w), 1
+        else:
+            xs, flip = range(w - 1, -1, -1), -1
+        for x in xs:
             old = img[y, x]
             new = 255.0 if old >= 128 else 0.0
-            err = (old - new) / 8.0
+            err = (old - new) / div
             img[y, x] = new
-            for dy, dx in ((0, 1), (0, 2), (1, -1), (1, 0), (1, 1), (2, 0)):
-                ny, nx = y + dy, x + dx
+            for dy, dx, wt in taps:
+                ny, nx = y + dy, x + dx * flip
                 if 0 <= ny < h and 0 <= nx < w:
-                    img[ny, nx] += err
+                    img[ny, nx] += err * wt
     return (img >= 128).astype(np.uint8) * 255
+
+
+def dither_atkinson(gray: np.ndarray) -> np.ndarray:
+    return error_diffuse(gray, "atkinson")
 
 
 def dither_ordered(gray: np.ndarray, n: int = 8) -> np.ndarray:
@@ -256,26 +289,161 @@ def dither_clustered(gray: np.ndarray, cell: int = 6) -> np.ndarray:
     return (gray.astype(np.float32) > tiled).astype(np.uint8) * 255
 
 
-def choose_dither(name: str, fax_heavy: bool, photo_fraction: float) -> str:
-    if name != "auto":
-        return name
+# --- Blue-noise (void-and-cluster) FM screening -------------------------------
+# Ulichney's void-and-cluster method builds an isotropic ("blue noise") threshold
+# matrix: no directional structure, no clustered low-frequency blotches. We
+# generate one 64x64 tile once and cache it as an asset (numpy-only, no scipy).
+_BLUE_NOISE = None
+
+
+def _gaussian_toroidal(arr: np.ndarray, sigma: float) -> np.ndarray:
+    """Wrap-around (tileable) Gaussian filter via FFT, matching scipy's
+    fourier_gaussian semantics so void/cluster ranking is stable."""
+    fy = np.fft.fftfreq(arr.shape[0])[:, None]
+    fx = np.fft.fftfreq(arr.shape[1])[None, :]
+    g = np.exp(-2.0 * (np.pi ** 2) * (sigma ** 2) * (fx ** 2 + fy ** 2))
+    return np.fft.ifft2(np.fft.fft2(arr) * g).real
+
+
+def _largest_void(binary: np.ndarray, sigma: float) -> int:
+    bp = binary if (np.count_nonzero(binary) * 2 < binary.size) else ~binary
+    f = _gaussian_toroidal(np.where(bp, 1.0, 0.0), sigma)
+    return int(np.argmin(np.where(bp, 2.0, f)))
+
+
+def _tightest_cluster(binary: np.ndarray, sigma: float) -> int:
+    bp = binary if (np.count_nonzero(binary) * 2 < binary.size) else ~binary
+    f = _gaussian_toroidal(np.where(bp, 1.0, 0.0), sigma)
+    return int(np.argmax(np.where(bp, f, -1.0)))
+
+
+def generate_blue_noise(shape=(64, 64), sigma=1.9, seed=0, frac=0.1) -> np.ndarray:
+    """Void-and-cluster blue-noise dither array (Ulichney 1993). Returns an int
+    array containing each rank 0..N-1 exactly once."""
+    rng = np.random.default_rng(seed)
+    n = int(np.prod(shape))
+    n_one = max(1, min(int((n - 1) / 2), int(n * frac)))
+    binary = np.zeros(shape, dtype=bool)
+    binary.flat[rng.permutation(n)[:n_one]] = True
+    while True:
+        c = _tightest_cluster(binary, sigma)
+        binary.flat[c] = False
+        v = _largest_void(binary, sigma)
+        if v == c:
+            binary.flat[c] = True
+            break
+        binary.flat[v] = True
+    dither = np.zeros(shape, dtype=np.int64)
+    bp = binary.copy()
+    for rank in range(n_one - 1, -1, -1):          # phase 1
+        c = _tightest_cluster(bp, sigma)
+        bp.flat[c] = False
+        dither.flat[c] = rank
+    bp = binary.copy()
+    for rank in range(n_one, (n + 1) // 2):        # phase 2
+        v = _largest_void(bp, sigma)
+        bp.flat[v] = True
+        dither.flat[v] = rank
+    for rank in range((n + 1) // 2, n):            # phase 3
+        c = _tightest_cluster(bp, sigma)
+        bp.flat[c] = True
+        dither.flat[c] = rank
+    return dither
+
+
+def _blue_noise_matrix() -> np.ndarray:
+    global _BLUE_NOISE
+    if _BLUE_NOISE is not None:
+        return _BLUE_NOISE
+    asset = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "..", "assets", "bluenoise_64.npy")
+    try:
+        _BLUE_NOISE = np.load(asset)
+    except Exception:
+        _BLUE_NOISE = generate_blue_noise((64, 64), sigma=1.9, seed=0)
+        try:
+            os.makedirs(os.path.dirname(asset), exist_ok=True)
+            np.save(asset, _BLUE_NOISE)
+        except Exception:
+            pass
+    return _BLUE_NOISE
+
+
+def dither_blue_noise(gray: np.ndarray) -> np.ndarray:
+    m = _blue_noise_matrix()
+    thr = (m.astype(np.float32) + 0.5) / m.size * 255.0
+    th, tw = m.shape
+    tiled = np.tile(thr, (gray.shape[0] // th + 1, gray.shape[1] // tw + 1))
+    tiled = tiled[:gray.shape[0], :gray.shape[1]]
+    return (gray.astype(np.float32) > tiled).astype(np.uint8) * 255
+
+
+# The curated "top 5" halftone technologies offered in the comparison preview,
+# spanning the design space: AM screening, FM/blue-noise, two error-diffusion
+# variants, and ordered. (jarvis/stucki/sierra are also selectable via --dither.)
+TOP5_METHODS = ["clustered", "blue-noise", "atkinson", "floyd", "ordered"]
+
+HALFTONE_INFO = {
+    "clustered": "Clustered-dot AM screening — longest runs, best G4 compression, "
+                 "most robust over a noisy line; lowest apparent resolution.",
+    "blue-noise": "Void-and-cluster blue noise (FM) — isotropic organic stipple, "
+                  "great perceived detail, no directional worms; mid compression.",
+    "atkinson": "Atkinson error diffusion — clean whites, crisp thin features; "
+                "good detail, looser compression than screening.",
+    "floyd": "Floyd-Steinberg error diffusion — classic, maximum detail; "
+             "directional speckle is the worst case for G4 size and line noise.",
+    "ordered": "Bayer ordered dithering — fast, predictable crosshatch; "
+               "middling on both detail and compression.",
+    "jarvis": "Jarvis-Judice-Ninke error diffusion — wide 12-tap kernel, very "
+              "smooth tone; heavy speckle, large G4 size.",
+    "stucki": "Stucki error diffusion — 12-tap, sharp and smooth for print; "
+              "heavy speckle, large G4 size.",
+    "sierra": "Sierra error diffusion — Jarvis-like smoothness, a little cheaper.",
+    "none": "Hard Otsu threshold — no halftone; correct for pure text, line art, "
+            "and barcodes/QR codes.",
+}
+
+# Accepted --dither aliases mapped to canonical names.
+DITHER_ALIASES = {"threshold": "none", "bayer": "ordered", "blue": "blue-noise"}
+
+
+def recommend_dither(photo_fraction: float, fax_heavy: bool) -> tuple:
+    """Suggest the OPTIMAL halftone for this page; returns (method, reason)."""
+    if photo_fraction < 0.03:
+        return "none", ("Page is essentially text / line art (photo area "
+                        f"{photo_fraction * 100:.0f}%); a hard threshold is the "
+                        "sharpest and smallest — halftoning would only add noise.")
     if fax_heavy or photo_fraction > 0.45:
-        return "clustered"
-    return "atkinson"
+        return "clustered", (f"Large photo area ({photo_fraction * 100:.0f}%) or "
+                             "fax-heavy mode: clustered-dot keeps runs long, so it "
+                             "compresses best and survives a noisy line.")
+    return "atkinson", (f"Moderate photo area ({photo_fraction * 100:.0f}%) on a "
+                        "clean line: Atkinson keeps detail and clean whites without "
+                        "the heavy speckle (and G4 bloat) of Floyd/Jarvis. For a "
+                        "softer, more isotropic look, blue-noise is the close runner-up.")
+
+
+def choose_dither(name: str, fax_heavy: bool, photo_fraction: float) -> str:
+    if name and name != "auto":
+        return DITHER_ALIASES.get(name, name)
+    return recommend_dither(photo_fraction, fax_heavy)[0]
 
 
 def halftone(gray: np.ndarray, name: str, vdpi: int) -> np.ndarray:
+    name = DITHER_ALIASES.get(name, name)
     if name == "none":
         return threshold_otsu(gray)
     if name == "floyd":
         return dither_floyd(gray)
-    if name == "atkinson":
-        return dither_atkinson(gray)
     if name == "ordered":
         return dither_ordered(gray)
+    if name == "blue-noise":
+        return dither_blue_noise(gray)
     if name == "clustered":
         cell = max(4, min(10, round(vdpi / 32)))  # scale screen to dpi
         return dither_clustered(gray, cell=cell)
+    if name in ED_KERNELS:
+        return error_diffuse(gray, name)
     raise ValueError(f"unknown dither: {name}")
 
 
@@ -318,26 +486,27 @@ def detect_washout_colors(page: fitz.Page) -> list:
     return sorted(warns)
 
 
-def process_page(page: fitz.Page, idx: int, opt: FaxOptions) -> tuple[Image.Image, PageReport]:
-    rep = PageReport(index=idx)
+def _prepare_page(page: fitz.Page, opt: FaxOptions):
+    """Rasterize + pre-clean a page and compute its photo mask, once.
+
+    Returns (gray, mask, photo_fraction, warnings, already_bilevel). The result
+    is reused both by the real conversion and by the multi-method comparison so
+    every halftone option is rendered from an identical starting point.
+    """
     hdpi, vdpi = RESOLUTIONS[opt.resolution]
+    warnings: list = []
+    gray = render_page_gray(page, hdpi, vdpi, opt.max_scanline_px)
 
     if is_already_bilevel(page):
-        rep.already_bilevel = True
-        gray = render_page_gray(page, hdpi, vdpi, opt.max_scanline_px)
-        bw = threshold_otsu(gray)
-        return _finalize(bw, rep, opt), rep
-
-    gray = render_page_gray(page, hdpi, vdpi, opt.max_scanline_px)
+        return gray, np.zeros_like(gray, dtype=bool), 0.0, warnings, True
 
     if opt.deskew:
         gray, ang = deskew_gray(gray)
         if ang:
-            rep.warnings.append(f"deskew:{ang:.1f}deg")
+            warnings.append(f"deskew:{ang:.1f}deg")
     if opt.flatten_bg:
         gray = flatten_background(gray)
 
-    # --- MRC segmentation: photo mask ---
     if opt.segmentation == "none":
         mask = np.zeros_like(gray, dtype=bool)
     elif opt.segmentation == "variance":
@@ -349,40 +518,61 @@ def process_page(page: fitz.Page, idx: int, opt: FaxOptions) -> tuple[Image.Imag
             mask = variance_photo_mask(gray)
 
     photo_fraction = float(mask.mean()) if mask.size else 0.0
-    rep.photo_regions = int(mask.any())
+    return gray, mask, photo_fraction, warnings, False
 
-    # --- route: hard threshold everywhere, then overlay halftone in photo mask.
-    # The halftone (esp. error diffusion) is the expensive step, so compute it
-    # only within the photo region's bounding box rather than the whole page.
+
+def _apply_dither(gray, mask, dither_name, opt, vdpi) -> np.ndarray:
+    """Hard-threshold the whole page, then overlay the chosen halftone inside the
+    photo mask only (bounded to its bbox — the halftone is the expensive step)."""
     text_bw = threshold_otsu(gray)
-    if mask.any():
-        dname = choose_dither(opt.dither, opt.fax_heavy, photo_fraction)
-        ys, xs = np.where(mask)
-        y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
-        sub_ht = halftone(gray[y0:y1, x0:x1], dname, vdpi)
-        bw = text_bw.copy()
-        sub_mask = mask[y0:y1, x0:x1]
-        region = bw[y0:y1, x0:x1]
-        region[sub_mask] = sub_ht[sub_mask]
-        bw[y0:y1, x0:x1] = region
-    else:
-        bw = text_bw
+    dither_name = DITHER_ALIASES.get(dither_name, dither_name)
+    if not mask.any() or dither_name == "none":
+        return text_bw
+    ys, xs = np.where(mask)
+    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    sub_ht = halftone(gray[y0:y1, x0:x1], dither_name, vdpi)
+    bw = text_bw.copy()
+    sub_mask = mask[y0:y1, x0:x1]
+    region = bw[y0:y1, x0:x1]
+    region[sub_mask] = sub_ht[sub_mask]
+    bw[y0:y1, x0:x1] = region
+    return bw
 
-    # inverted-region warning: large black fraction transmits slowly
+
+def process_page(page: fitz.Page, idx: int, opt: FaxOptions) -> tuple[Image.Image, PageReport]:
+    rep = PageReport(index=idx)
+    _hdpi, vdpi = RESOLUTIONS[opt.resolution]
+    gray, mask, photo_fraction, warnings, already = _prepare_page(page, opt)
+    rep.warnings.extend(warnings)
+    rep.photo_fraction = round(photo_fraction, 4)
+
+    if already:
+        rep.already_bilevel = True
+        rep.dither = "none"
+        return _finalize(threshold_otsu(gray), rep, opt), rep
+
+    rep.photo_regions = int(mask.any())
+    dname = choose_dither(opt.dither, opt.fax_heavy, photo_fraction)
+    rep.dither = dname
+    bw = _apply_dither(gray, mask, dname, opt, vdpi)
+
     if (bw == 0).mean() > 0.45:
         rep.warnings.append("inverted_or_heavy_black")
-
     rep.warnings.extend(detect_washout_colors(page))
     return _finalize(bw.astype(np.uint8), rep, opt), rep
 
 
-def _finalize(bw: np.ndarray, rep: PageReport, opt: FaxOptions) -> Image.Image:
+def _postclean(bw: np.ndarray, opt: FaxOptions) -> np.ndarray:
     if opt.despeckle:
         bw = despeckle_bw(bw)
     if opt.thicken:
         bw = thicken_bw(bw)
+    return bw
+
+
+def _finalize(bw: np.ndarray, rep: PageReport, opt: FaxOptions) -> Image.Image:
     # Pillow 1-bit: 0=black,255=white -> mode '1'
-    return Image.fromarray(bw).convert("1")
+    return Image.fromarray(_postclean(bw, opt)).convert("1")
 
 
 # --------------------------------------------------------------------------- #
@@ -445,3 +635,105 @@ def render_preview(in_pdf: str, page_no: int, out_png: str, opt: FaxOptions):
     img, _ = process_page(page, page_no, opt)
     img.convert("L").save(out_png)
     return out_png
+
+
+# --------------------------------------------------------------------------- #
+# Multi-method comparison preview ("spend your eye tokens here")              #
+# --------------------------------------------------------------------------- #
+def _load_font(size: int):
+    from PIL import ImageFont
+    for name in ("arial.ttf", "DejaVuSans.ttf", "LiberationSans-Regular.ttf",
+                 "Helvetica.ttf"):
+        try:
+            return ImageFont.truetype(name, size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def _compose_contact_sheet(panels, metrics, recommended, cell_w=480):
+    """panels: list of (method_name, PIL '1' image). Returns an RGB contact
+    sheet with a labeled, metric-annotated panel per method."""
+    from PIL import ImageDraw
+    rendered = []
+    for name, img in panels:
+        rgb = img.convert("L").convert("RGB")
+        ch = max(1, int(rgb.height * (cell_w / rgb.width)))
+        rendered.append((name, rgb.resize((cell_w, ch), Image.LANCZOS)))
+
+    cap, pad, title_h = 56, 16, 70
+    cols = 3 if len(rendered) > 4 else max(1, len(rendered))
+    rows = (len(rendered) + cols - 1) // cols
+    cell_h = max(r.height for _, r in rendered)
+    W = pad + cols * (cell_w + pad)
+    H = title_h + rows * (cell_h + cap + pad) + pad
+    canvas = Image.new("RGB", (W, H), (245, 245, 245))
+    d = ImageDraw.Draw(canvas)
+    tf, cf, sf = _load_font(28), _load_font(19), _load_font(15)
+    d.text((pad, 16), "Fax halftone comparison \u2014 spend your eye tokens: "
+           "pick the panel that reads best", font=tf, fill=(15, 15, 15))
+
+    for i, (name, rgb) in enumerate(rendered):
+        r, c = divmod(i, cols)
+        x = pad + c * (cell_w + pad)
+        y = title_h + r * (cell_h + cap + pad)
+        is_rec = (name == recommended)
+        d.rectangle([x, y, x + cell_w, y + cap],
+                    fill=(206, 234, 206) if is_rec else (224, 224, 224))
+        d.text((x + 8, y + 6),
+                name.upper() + ("   >> RECOMMENDED <<" if is_rec else ""),
+                font=cf, fill=(10, 10, 10))
+        m = metrics.get(name, {})
+        d.text((x + 8, y + 30),
+                f"{m.get('encoded_bytes', 0) / 1024:.0f} KB  \u00b7  "
+                f"~{m.get('est_transmission_s', 0):.0f}s / page",
+                font=sf, fill=(70, 70, 70))
+        canvas.paste(rgb, (x, y + cap))
+        d.rectangle([x, y, x + cell_w, y + cap + rgb.height],
+                    outline=(38, 148, 38) if is_rec else (178, 178, 178),
+                    width=3 if is_rec else 1)
+    return canvas
+
+
+def render_comparison(in_pdf: str, page_no: int, out_png: str, opt: FaxOptions,
+                      methods=None) -> dict:
+    """Render one page through several halftone methods into a single contact
+    sheet, annotated with per-method G4 size + transmission estimate and a
+    recommended pick, so a human can choose the optimal one by eye ("eye
+    tokens"). Returns a dict of metrics + recommendation."""
+    methods = methods or TOP5_METHODS
+    _hdpi, vdpi = RESOLUTIONS[opt.resolution]
+    doc = fitz.open(in_pdf)
+    page = doc[page_no - 1]
+    gray, mask, photo_fraction, _warn, already = _prepare_page(page, opt)
+
+    tmpdir = tempfile.mkdtemp(prefix="faxcmp_")
+    panels, metrics = [], {}
+    for m in methods:
+        bw = _postclean(_apply_dither(gray, mask, m, opt, vdpi), opt)
+        img = Image.fromarray(bw.astype(np.uint8)).convert("1")
+        tp = os.path.join(tmpdir, f"{m}.tif")
+        nbytes = encode_g4_tiff(img, tp)
+        metrics[m] = {
+            "encoded_bytes": nbytes,
+            "est_transmission_s": round(
+                nbytes * 8 / opt.line_rate_bps + opt.page_overhead_s, 1),
+            "info": HALFTONE_INFO.get(DITHER_ALIASES.get(m, m), ""),
+        }
+        panels.append((m, img))
+
+    rec, reason = recommend_dither(photo_fraction, opt.fax_heavy)
+    if rec not in metrics:  # ensure the recommended panel is shown/highlighted
+        rec = min(metrics, key=lambda k: metrics[k]["encoded_bytes"])
+    _compose_contact_sheet(panels, metrics, rec).save(out_png)
+    smallest = min(metrics, key=lambda k: metrics[k]["encoded_bytes"])
+    return {
+        "page": page_no,
+        "already_bilevel": already,
+        "photo_fraction": round(photo_fraction, 4),
+        "methods": metrics,
+        "recommended": rec,
+        "reason": reason,
+        "smallest": smallest,
+        "output": out_png,
+    }

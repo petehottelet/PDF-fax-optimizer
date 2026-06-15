@@ -68,32 +68,67 @@ Geometry rules the pipeline enforces:
 
 The algorithm matters more than the decision to "just dither it," because each
 choice sits at a different point on the fidelity ↔ transition-density curve.
+Transition density is the cost axis: more black↔white transitions per scanline
+means worse G4 compression, longer transmission, and more line-noise fragility.
 
-- **Error diffusion** — Floyd-Steinberg, Atkinson, Stucki. Best *perceived*
-  detail for photographs because quantization error is pushed to neighbors,
+### The top 5 (what the skill ships)
+
+| Method (`--dither`) | Family | Detail | G4 size | Noise robustness |
+|---|---|---|---|---|
+| `clustered` | AM screening (clustered-dot) | low–med | **best** | **best** |
+| `blue-noise` | FM screening (void-and-cluster) | **high** | medium | medium |
+| `atkinson` | error diffusion (6/8) | high | med | low–med |
+| `floyd` | error diffusion | **highest** | **worst** | **worst** |
+| `ordered` | ordered (Bayer) | medium | medium | medium |
+
+- **Clustered-dot (AM) screening** — like newsprint. Dots grow in clusters, so
+  runs are long and compression is far better; it survives transmission and
+  re-thresholding best. The cost is lower apparent resolution. `--fax-heavy`
+  selects it.
+- **Blue noise (void-and-cluster, FM screening)** — Ulichney's method builds an
+  isotropic threshold matrix with energy concentrated at high frequencies. The
+  result is an organic stipple with **no directional "worms"** and no clustered
+  low-frequency blotches, so it looks clean to the eye and re-thresholds
+  gracefully. Compression and robustness land between screening and error
+  diffusion. (The pipeline caches a 64×64 tile in `assets/bluenoise_64.npy`,
+  generated numpy-only — no scipy.)
+- **Error diffusion** — Floyd-Steinberg, Atkinson (and the heavier `jarvis`,
+  `stucki`, `sierra` kernels, selectable but not in the headline 5). Best
+  *perceived* detail because quantization error is pushed to neighbors,
   preserving local average tone. But it produces **dispersed, high-frequency
   speckle** — the worst case for run-length compression and the most fragile
-  over a noisy line. Atkinson diffuses only part of the error, giving cleaner
-  whites and slightly better compression than Floyd-Steinberg, and tends to keep
-  thin features.
-- **Clustered-dot (AM) screening** — like newsprint. Dots grow in clusters, so
-  runs are long and compression is far better; it also survives transmission and
-  re-thresholding better. The cost is lower apparent resolution.
-- **Ordered / Bayer (dispersed)** — cheap threshold-map method; between the two
-  on both axes. Predictable, fast, no error propagation.
+  over a noisy line. Atkinson diffuses only 6/8 of the error, giving cleaner
+  whites, better thin-feature survival, and slightly better runs than
+  Floyd-Steinberg. The pipeline scans serpentine to break up directional worms.
+- **Ordered / Bayer (dispersed)** — cheap threshold-map method; between the
+  others on both axes. Predictable, fast, no error propagation.
 
-Decision guide:
+Decision guide (`recommend_dither`):
 
-- Photos where detail matters and the line is clean → error diffusion
-  (`atkinson` slightly compresses better than `floyd`).
-- "Fax-heavy" mode, long documents, or a known-noisy line → **clustered**.
-  This is what `--fax-heavy` selects.
-- `--dither auto` chooses clustered when the page's photo area is large or
-  `--fax-heavy` is set, otherwise Atkinson.
+- Photo area < 3% (essentially text/line-art) → `none` (hard threshold): sharpest
+  and smallest; halftoning would only add noise.
+- Photo area > 45% or `--fax-heavy` → **clustered**: keep runs long so it
+  compresses and survives a noisy line.
+- Otherwise → **atkinson**: detail and clean whites without Floyd/Jarvis bloat,
+  with `blue-noise` the close runner-up for a softer, isotropic look.
+
+`--dither auto` applies exactly this logic. But the recommendation is only a
+starting point — see *Spend your eye tokens* below.
 
 Critically, **match the screen frequency to the fax resolution.** Too fine a
 screen for the dpi collapses to mud after the receiving machine re-thresholds.
 The pipeline scales the clustered cell size from the target dpi for this reason.
+
+### Spend your eye tokens — the comparison preview
+
+Compression metrics are objective; *readability* is not. Only a human eye can
+decide whether a given halftone "reads" for a given document. So the skill can
+render one page through all five methods into a single labeled **contact sheet**
+(`--compare-page N` → `OUTPUT.compare_pN.png`), each panel annotated with its
+real G4 size and transmission estimate, with the recommended pick highlighted.
+The agent suggests the optimal method; the user spends their **eye tokens** to
+confirm or override it, then the final file is produced with the chosen
+`--dither`. Use `--compare-methods a,b,c` to control which methods appear.
 
 ---
 
@@ -175,7 +210,9 @@ The output should be cheap and robust to send, not just small on disk:
 | Flag | Default | Why it exists |
 |---|---|---|
 | `--fax-resolution` | `fine` | Native dpi; anisotropic, avoids moiré |
-| `--dither` | `auto` | Fidelity vs. transition-density trade-off (§3) |
+| `--dither` | `auto` | Fidelity vs. transition-density trade-off (§3); one of clustered, blue-noise, atkinson, floyd, ordered, jarvis, stucki, sierra, none |
+| `--compare-page` | none | Render all top-5 methods to one contact sheet so a human can pick by eye (§3) |
+| `--compare-methods` | top 5 | Override which halftones appear in the comparison |
 | `--fax-heavy` | off | Bias to clustered: compresses + survives noisy lines |
 | `--segmentation` | `embedded` | MRC routing; `variance` for flattened scans |
 | `--thicken` | off | Save hairlines/small fonts from vanishing (§5) |
