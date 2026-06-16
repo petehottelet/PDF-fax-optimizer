@@ -154,8 +154,14 @@ python pdf-fax-optimizer/scripts/optimize_pdf.py input.pdf -o output.fax.pdf \
     --fax-resolution fine --compare-page 1 --compare-original
 ```
 
+### Text That Survives the Fax
+
+MRC-lite segmentation keeps your text crisp and undithered while photos get the
+halftone treatment, so the page that lands on the receiving machine is one a
+human can actually read.
+
 <p align="center">
-  <img src="docs/compare_example.png" alt="Text That Survives the Fax: MRC-lite segmented text halftoning comparison" width="100%">
+  <img src="docs/compare_example.png" alt="Six-panel fax comparison showing original color, true grayscale, and four fax halftone treatments" width="100%">
 </p>
 
 ## Input formats — fax a Word, PowerPoint, Excel, or image file

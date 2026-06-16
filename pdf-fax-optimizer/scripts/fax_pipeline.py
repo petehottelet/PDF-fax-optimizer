@@ -22,7 +22,6 @@ import io
 import os
 import tempfile
 from dataclasses import dataclass, field
-from typing import Optional
 
 import numpy as np
 import cv2
@@ -1007,50 +1006,6 @@ def _oswald_font(size: int, weight: str = "Bold"):
     return _load_font(size)
 
 
-def _helvetica_font(size: int):
-    """Use Helvetica for subheads when available, with close system fallbacks."""
-    from PIL import ImageFont
-    for name in ("Helvetica.ttf", "Arial.ttf", "arial.ttf",
-                 "LiberationSans-Regular.ttf", "DejaVuSans.ttf"):
-        try:
-            return ImageFont.truetype(name, size)
-        except Exception:
-            continue
-    return _load_font(size)
-
-
-def _draw_wrapped_text(draw, xy, text, font, fill, max_width, line_gap=4):
-    """Draw text wrapped to max_width and return the next y coordinate."""
-    words = text.split()
-    lines, line = [], ""
-    for word in words:
-        candidate = word if not line else f"{line} {word}"
-        if draw.textbbox((0, 0), candidate, font=font)[2] <= max_width:
-            line = candidate
-        else:
-            if line:
-                lines.append(line)
-            line = word
-    if line:
-        lines.append(line)
-    x, y = xy
-    for line in lines:
-        draw.text((x, y), line, font=font, fill=fill)
-        box = draw.textbbox((x, y), line, font=font)
-        y += (box[3] - box[1]) + line_gap
-    return y
-
-
-def _project_asset_path(name: str) -> Optional[str]:
-    """Find optional project-only artwork used for README/GitHub examples."""
-    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    for folder in ("00_project_files", "00_Project_Files"):
-        path = os.path.join(root, folder, name)
-        if os.path.exists(path):
-            return path
-    return None
-
-
 def _compose_contact_sheet(panels, metrics, recommended, cell_w=480):
     """panels: list of (method_name, PIL '1' image). Returns an RGB contact
     sheet with a labeled, metric-annotated panel per method."""
@@ -1061,7 +1016,7 @@ def _compose_contact_sheet(panels, metrics, recommended, cell_w=480):
         ch = max(1, int(rgb.height * (cell_w / rgb.width)))
         rendered.append((name, rgb.resize((cell_w, ch), Image.LANCZOS)))
 
-    cap, pad, title_h = 58, 18, 230
+    cap, pad, title_h = 58, 18, 18
     cols = 3 if len(rendered) > 4 else max(1, len(rendered))
     rows = (len(rendered) + cols - 1) // cols
     cell_h = max(r.height for _, r in rendered)
@@ -1069,33 +1024,7 @@ def _compose_contact_sheet(panels, metrics, recommended, cell_w=480):
     H = title_h + rows * (cell_h + cap + pad) + pad
     canvas = Image.new("RGB", (W, H), (244, 244, 244))
     d = ImageDraw.Draw(canvas)
-    title_f = _oswald_font(74, "Medium")
-    subhead_f = _helvetica_font(24)
     lf, sf = _oswald_font(22, "SemiBold"), _load_font(15)
-
-    # README one-sheet masthead. Uses project-only artwork when present, while
-    # still letting the packaged skill generate comparison sheets without it.
-    d.rectangle([0, 0, W, title_h - 8], fill=(255, 255, 255))
-    logo_path = _project_asset_path("logo_1sheet.png")
-    text_x = pad
-    if logo_path:
-        try:
-            logo = Image.open(logo_path).convert("RGBA")
-            logo_h = min(196, logo.height)
-            logo_w = round(logo.width * (logo_h / logo.height))
-            logo = logo.resize((logo_w, logo_h), Image.LANCZOS)
-            canvas.paste(logo, (pad, 0), logo)
-            text_x = pad + logo_w + 18
-        except Exception:
-            text_x = pad
-    d.text((text_x, 22), "Text That Survives the Fax",
-           font=title_f, fill=(0, 0, 0))
-    _draw_wrapped_text(
-        d, (text_x + 2, 126),
-        "MRC-lite segmentation keeps your text crisp and undithered while "
-        "photos get the halftone treatment, so the page that lands on the "
-        "receiving machine is one a human can actually read.",
-        subhead_f, (45, 45, 45), W - text_x - pad, line_gap=6)
 
     for i, (name, rgb) in enumerate(rendered):
         r, c = divmod(i, cols)
