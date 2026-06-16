@@ -96,12 +96,16 @@ What the pipeline does, per page (details in the reference):
    binarizer* and kept crisp; photos / continuous-tone regions are routed to a
    halftone. *Never dither text* — it destroys edge sharpness and legibility.
    Region detection uses the PDF's own embedded-image rectangles, not guesswork.
+   **Text baked into an image** (captions, signs, screenshots, or a whole page
+   scanned as one image) is detected *inside* the photo region and kept legible
+   instead of being halftoned (`--no-text-in-image` to disable).
 3. **Pre-clean:** flatten near-white backgrounds to pure white (so faint content
    survives thresholding), despeckle isolated black pixels, and deskew.
-4. **Binarize the text/line content** with `--text-binarize` (default `sauvola`,
-   a document-imaging adaptive threshold that holds up over dark header bars,
-   reverse type, and uneven illumination far better than a single global cut;
-   `niblack`/`wolf`/`bradley`/`otsu` also available).
+4. **Binarize the text/line content** with `--text-binarize` (default `contrast`,
+   tuned for legibility: it pulls gray / light-gray text on white to *solid black*
+   instead of dropping it, and holds up over dark header bars, reverse type, and
+   uneven illumination far better than a single global cut; `sauvola`/`niblack`/
+   `wolf`/`bradley`/`otsu` also available). Text is never halftoned.
 5. **Halftone the photo regions** with the chosen schema. Photos first get
    *dot-gain pre-correction* (`--tone-curve auto`, so midtones don't plug to a
    black silhouette) and optional edge sharpening (`--sharpen`). `--dither auto`
@@ -178,7 +182,10 @@ highlighted**.
 The skill therefore does both jobs the user asked for: (a) it **suggests the
 optimal** method from the page's content (photo fraction, fax-heavy, line
 condition), and (b) it lets the user **choose the optimal** by eye from the
-contact sheet. Offer this whenever a fax has meaningful photo content — then
+contact sheet. Add `--compare-original` to lead the sheet with two reference
+panels — the original in color (#1) and a true grayscale of it (#2) — followed
+by four halftones, so the viewer can see exactly what each schema is
+approximating. Offer this whenever a fax has meaningful photo content — then
 re-run with the chosen `--dither` for the final file. (Use `--compare-methods`
 to override which methods appear.)
 

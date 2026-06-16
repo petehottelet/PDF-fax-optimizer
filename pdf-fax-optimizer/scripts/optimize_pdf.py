@@ -43,11 +43,12 @@ def build_fax_options(cfg, args) -> fax.FaxOptions:
         deskew=pick(args.deskew, "deskew", True),
         fmt=pick(args.format, "format", "pdf"),
         line_rate_bps=pick(args.line_rate, "line_rate_bps", 14400),
-        text_binarize=pick(args.text_binarize, "text_binarize", "sauvola"),
+        text_binarize=pick(args.text_binarize, "text_binarize", "contrast"),
         tone_curve=pick(args.tone_curve, "tone_curve", "auto"),
         sharpen=args.sharpen or fc.get("sharpen", False),
         green_noise_coarseness=pick(args.green_noise_coarseness,
                                     "green_noise_coarseness", 4.0),
+        text_in_image=pick(args.text_in_image, "text_in_image", True),
     )
 
 
@@ -72,13 +73,20 @@ def main():
                    dest="green_noise_coarseness",
                    help="green-noise AM<->FM knob ~2 (detail) .. 8 (robust)")
     p.add_argument("--text-binarize",
-                   choices=["sauvola", "niblack", "wolf", "bradley", "otsu"],
+                   choices=["contrast", "sauvola", "niblack", "wolf", "bradley",
+                            "otsu"],
                    default=None,
-                   help="adaptive binarizer for text/line content (default sauvola)")
+                   help="binarizer for text/line content; 'contrast' (default) "
+                        "maximizes legibility by forcing gray/light text to "
+                        "solid black")
     p.add_argument("--tone-curve", choices=["auto", "none"], default=None,
                    help="per-family dot-gain pre-correction for photos")
     p.add_argument("--sharpen", action="store_true",
                    help="edge-aware unsharp on photo regions before halftoning")
+    p.add_argument("--no-text-in-image", dest="text_in_image",
+                   action="store_false", default=None,
+                   help="don't rescue text baked into photos; halftone the whole "
+                        "image region (text-in-image rescue is on by default)")
     p.add_argument("--fax-heavy", action="store_true")
     p.add_argument("--segmentation",
                    choices=["embedded", "variance", "none"], default=None)
@@ -98,6 +106,9 @@ def main():
     p.add_argument("--compare-methods", default=None,
                    help="comma-separated halftone names for --compare-page "
                         "(default: the curated 6-up set)")
+    p.add_argument("--compare-original", action="store_true",
+                   help="lead the contact sheet with original-color (#1) and "
+                        "true-grayscale (#2) references, then four halftones (6-up)")
     p.add_argument("--keep-converted-pdf", action="store_true",
                    help="when input is Office/image, keep the intermediate PDF "
                         "next to the output instead of deleting it")
@@ -147,13 +158,18 @@ def main():
         png = (os.path.splitext(args.output)[0]
                + f".compare_p{args.compare_page}.png")
         comparison = fax.render_comparison(
-            src_pdf, args.compare_page, png, opt, methods)
+            src_pdf, args.compare_page, png, opt, methods,
+            include_original=args.compare_original)
         print(f"Comparison contact sheet: {png}")
         print(f"  recommended: {comparison['recommended']}  "
               f"(smallest: {comparison['smallest']})")
         print(f"  why: {comparison['reason']}")
         print("  spend your eye tokens \u2014 per-method G4 size / page:")
         for m, mm in comparison["methods"].items():
+            if mm.get("original"):
+                print(f"    {m:11s} {'  source':>9s}  "
+                      f"({mm.get('note', 'reference, not faxed')})")
+                continue
             star = "  <- recommended" if m == comparison["recommended"] else ""
             print(f"    {m:11s} {mm['encoded_bytes'] / 1024:6.0f} KB  "
                   f"~{mm['est_transmission_s']:.0f}s{star}")

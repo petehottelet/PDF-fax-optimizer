@@ -40,7 +40,9 @@ The `SKILL.md` format is an open standard. This skill is built and tested for
   204×196, `superfine` 204×391), resampling axes independently and clamping the
   scanline to 1728 px.
 - MRC-lite segmentation using the PDF's embedded-image rectangles: text/line-art
-  → hard threshold; photos → halftone.
+  → hard threshold; photos → halftone. **Text found *inside* an image** (a
+  flattened page, screenshot, caption, or sign) is detected, segmented out, and
+  kept crisp instead of being halftoned with the picture around it.
 - Pre-cleans: background flatten, despeckle, deskew; optional stroke thickening
   to save hairlines and small fonts.
 - Emits lossless CCITT-G4 (no re-encode) via img2pdf — a `CCITTFaxDecode` PDF or
@@ -55,13 +57,58 @@ The goal is to **optimize the document for transmission**, not to make it look
 like a generic fax. The skill treats a page as Mixed Raster Content and applies a
 *different, selectable schema* to each kind of content:
 
-- **Text / line art** → an **adaptive binarizer** (`--text-binarize`, default
-  `sauvola`; also `niblack`, `wolf`, `bradley`, `otsu`). Per-pixel thresholds
-  keep glyphs crisp over dark header bars, reverse type, and uneven illumination
-  where a single global cut drops text or fills shadows.
+- **Text / line art** → a contrast-maximizing binarizer (`--text-binarize`,
+  default `contrast`; also `sauvola`, `niblack`, `wolf`, `bradley`, `otsu`).
+  Text is **never halftoned** — it is thresholded for legibility, pulling gray /
+  light-gray text on white to **solid black**, and holding glyphs crisp over dark
+  header bars, reverse type, and uneven illumination where a single global cut
+  drops light text or fills shadows.
 - **Photos / continuous tone** → a **halftone schema** (`--dither`), with
   **dot-gain pre-correction** (`--tone-curve auto`, so midtones don't plug to a
   black silhouette) and optional **edge sharpening** (`--sharpen`).
+- **Text baked into an image** (captions, signs, screenshots, or a whole page
+  scanned as a single image) → detected *inside* the photo region and routed back
+  to the legibility path, so it stays readable instead of dissolving into a
+  halftone screen (`--no-text-in-image` to disable). See the next section.
+
+### Text inside images — found, separated, and kept legible
+
+Plenty of real fax jobs are full of text that *isn't* live text: a whole page
+exported or scanned as a single image, a screenshot, a caption or label burned
+into a photo, a sign in a snapshot. If that page were treated as one big picture
+and halftoned, the words would dissolve into dot-screen mud — the exact failure
+this skill exists to prevent. So the pipeline never stops at "photo vs.
+not-photo"; it looks **inside** every photo region for text and pulls it back
+onto the legibility path. Four steps:
+
+1. **Identify the text within the image.** A morphological top-hat / black-hat
+   filter (scaled to the fax DPI) isolates thin, high-contrast strokes — light
+   text *or* dark — while ignoring the smooth tonal gradients of a real
+   photograph.
+2. **Segment it properly.** Strong stroke responses are grouped into horizontal
+   runs and passed through connected-component analysis, keeping only components
+   whose geometry actually reads as a line of text (wide, short, reasonably
+   dense), then dilated from the stroke edges out to full glyph bodies. The
+   detector is deliberately conservative — it would rather miss faint text than
+   carve hard black blobs out of ordinary photo detail.
+3. **Treat the text separately.** Inside the photo region, the detected text
+   pixels are routed to the same **text binarizer** used for live text
+   (`--text-binarize`, `contrast` by default) and rendered as crisp solid black,
+   while everything around them is still halftoned for the channel. The
+   two are composited back together, so one image can carry sharp text *and* a
+   properly screened photo at the same time.
+4. **Enhance it if needed.** The binarizer pulls gray and light-gray lettering
+   up to solid black instead of dropping it; `--thicken` rescues hairline strokes
+   and sub-minimum fonts that would otherwise vanish at low DPI; reverse
+   (white-on-black) type and solid fills are carried across intact rather than
+   hollowed out.
+
+The payoff: **even when the rest of an image is aggressively optimized for fax
+transmission, the words inside it stay legible.** This is exactly what happens
+with a flattened, "printed-to-image" PDF whose entire page is a single raster —
+the body copy, headings, and tables are detected and kept crisp while only the
+genuine photographs on the page are halftoned. (Turn the behavior off with
+`--no-text-in-image`.)
 
 ### Halftone schemas + the "eye tokens" comparison preview
 
@@ -100,10 +147,15 @@ python pdf-fax-optimizer/scripts/optimize_pdf.py input.pdf -o output.fax.pdf \
     --fax-resolution fine --compare-page 1
 # -> writes output.fax.compare_p1.png (a 6-up of clustered/green-noise/
 #    blue-noise/atkinson/floyd/line so you can pick the panel that reads best)
+
+# Add --compare-original to lead with two reference panels — the original in
+# color (#1) and a true grayscale of it (#2) — followed by four halftones:
+python pdf-fax-optimizer/scripts/optimize_pdf.py input.pdf -o output.fax.pdf \
+    --fax-resolution fine --compare-page 1 --compare-original
 ```
 
 <p align="center">
-  <img src="docs/compare_example.png" alt="Six fax-optimized halftones of one page side by side — spend your eye tokens and pick the panel that reads best" width="100%">
+  <img src="docs/compare_example.png" alt="Text That Survives the Fax: MRC-lite segmented text halftoning comparison" width="100%">
 </p>
 
 ## Input formats — fax a Word, PowerPoint, Excel, or image file
@@ -187,11 +239,11 @@ location:
 | **OpenAI Codex** | `~/.codex/skills/pdf-fax-optimizer/` | `.agents/skills/pdf-fax-optimizer/` |
 
 ```bash
-git clone https://github.com/petehottelet/PDF-fax-optimizer.git
+git clone https://github.com/petehottelet/pdf-fax-optimizer.git
 # Claude Code
-cp -r PDF-fax-optimizer/pdf-fax-optimizer ~/.claude/skills/pdf-fax-optimizer
+cp -r pdf-fax-optimizer/pdf-fax-optimizer ~/.claude/skills/pdf-fax-optimizer
 # OpenAI Codex
-cp -r PDF-fax-optimizer/pdf-fax-optimizer ~/.codex/skills/pdf-fax-optimizer
+cp -r pdf-fax-optimizer/pdf-fax-optimizer ~/.codex/skills/pdf-fax-optimizer
 ```
 
 **Claude Code** discovers skills automatically (no restart) and you can invoke
@@ -200,7 +252,7 @@ folder so the folder is the archive root, then upload it under
 Settings → Capabilities → Skills:
 
 ```bash
-cd PDF-fax-optimizer && zip -r pdf-fax-optimizer.zip pdf-fax-optimizer
+cd pdf-fax-optimizer && zip -r pdf-fax-optimizer.zip pdf-fax-optimizer
 ```
 
 **OpenAI Codex** keeps skills behind an experimental flag — enable it once, then

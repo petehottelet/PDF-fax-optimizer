@@ -55,10 +55,11 @@ class FaxOptions:
     page_overhead_s: float = 1.5
     min_font_px: int = 12           # below this stroke height -> warn / thicken
     # Document-optimization knobs (halftoning-schemas.md)
-    text_binarize: str = "sauvola"  # sauvola|niblack|wolf|bradley|otsu
+    text_binarize: str = "contrast"  # contrast|sauvola|niblack|wolf|bradley|otsu
     tone_curve: str = "auto"        # auto|none  (dot-gain pre-correction)
     sharpen: bool = False           # edge-aware unsharp on photo regions
     green_noise_coarseness: float = 4.0  # green-noise AM<->FM knob (~2..8)
+    text_in_image: bool = True      # rescue text baked into photos (don't halftone it)
 
 
 @dataclass
@@ -95,6 +96,24 @@ def render_page_gray(page: fitz.Page, hdpi: int, vdpi: int,
     pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY, alpha=False)
     arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
     return arr.copy()
+
+
+def render_page_color(page: fitz.Page, hdpi: int, vdpi: int,
+                      max_w: int) -> np.ndarray:
+    """Render a page to an RGB ndarray at the same grid as render_page_gray.
+
+    Used only for the comparison contact sheet's reference panel, so a viewer can
+    see the original color document next to its grayscale and halftoned versions.
+    """
+    sx, sy = hdpi / 72.0, vdpi / 72.0
+    page_w_pt = page.rect.width
+    if page_w_pt * sx > max_w:
+        sx = max_w / page_w_pt
+    mat = fitz.Matrix(sx, sy)
+    pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB, alpha=False)
+    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+        pix.height, pix.width, pix.n)
+    return arr[:, :, :3].copy()
 
 
 def photo_region_mask(page: fitz.Page, shape, hdpi, vdpi, max_w,
@@ -135,12 +154,21 @@ def photo_region_mask(page: fitz.Page, shape, hdpi, vdpi, max_w,
 
 
 def variance_photo_mask(gray: np.ndarray, block: int = 24,
-                        var_lo: float = 80.0, var_hi: float = 4000.0) -> np.ndarray:
+                        var_lo: float = 80.0, var_hi: float = 4000.0,
+                        min_area_frac: float = 0.015) -> np.ndarray:
     """Heuristic photo mask for flattened scans.
 
     Text/line-art blocks are bimodal (very high variance, sparse); flat
     background is near-zero variance; continuous-tone photo blocks fall in a
     mid band. We mark mid-variance blocks and clean up with morphology.
+
+    Text protection: gray / anti-aliased text often lands in the mid band, and a
+    naive CLOSE then welds those strokes into the photo blob — so the text gets
+    halftoned and becomes hard to read (exactly what we must avoid). We therefore
+    OPEN first (with a small kernel) to erase thin text strokes, CLOSE to
+    consolidate the genuine photo interior, then keep only large connected
+    components. Real photos are big contiguous regions; text-induced specks are
+    small and get dropped, so halftoning stays on image sections only.
     """
     h, w = gray.shape
     gf = gray.astype(np.float32)
@@ -148,23 +176,32 @@ def variance_photo_mask(gray: np.ndarray, block: int = 24,
     sq = cv2.boxFilter(gf * gf, -1, (block, block))
     var = np.clip(sq - mean * mean, 0, None)
     band = ((var > var_lo) & (var < var_hi)).astype(np.uint8)
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (block, block))
-    band = cv2.morphologyEx(band, cv2.MORPH_CLOSE, k)
-    band = cv2.morphologyEx(band, cv2.MORPH_OPEN, k)
-    return band.astype(bool)
+    k_open = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (max(3, block // 3), max(3, block // 3)))
+    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (block, block))
+    band = cv2.morphologyEx(band, cv2.MORPH_OPEN, k_open)
+    band = cv2.morphologyEx(band, cv2.MORPH_CLOSE, k_close)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(band, 8)
+    out = np.zeros_like(band)
+    min_area = min_area_frac * h * w
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] >= min_area:
+            out[labels == i] = 1
+    return out.astype(bool)
 
 
 # --------------------------------------------------------------------------- #
 # Pre-cleaning                                                                #
 # --------------------------------------------------------------------------- #
-def flatten_background(gray: np.ndarray, knee: int = 200) -> np.ndarray:
-    """Push near-white pixels to pure white so faint content survives threshold,
-    and gently stretch contrast below the knee."""
-    out = gray.astype(np.float32)
-    out[out >= knee] = 255.0
-    below = out < knee
-    out[below] = np.clip(out[below] * (255.0 / knee), 0, 255)
-    return out.astype(np.uint8)
+def flatten_background(gray: np.ndarray, knee: int = 235) -> np.ndarray:
+    """Push near-white pixels to pure white so the background is clean, WITHOUT
+    brightening the midtones. The old version stretched everything below the knee
+    toward white, which washed out gray / light-gray text (a legibility killer);
+    the text binarizer below is responsible for pulling that text to solid black,
+    so here we only clamp the near-white paper and leave real content intact."""
+    out = gray.copy()
+    out[out >= knee] = 255
+    return out
 
 
 def deskew_gray(gray: np.ndarray) -> tuple[np.ndarray, float]:
@@ -243,14 +280,26 @@ def _local_mean_std(gray: np.ndarray, r: int):
 
 
 def binarize_text(gray: np.ndarray, method: str, vdpi: int) -> np.ndarray:
-    """Return a 0/255 bilevel image (0=black) for text/line content."""
-    method = (method or "sauvola").lower()
+    """Return a 0/255 bilevel image (0=black) for text/line content.
+
+    The whole point of a fax is to be READ, so text is never halftoned — it is
+    thresholded to maximize contrast. The default ('contrast') is tuned for
+    legibility: it marks black wherever a pixel is darker than its local paper by
+    a small margin, so gray / light-gray text on a white background is pulled to
+    SOLID BLACK instead of being dropped (the failure mode of a conservative
+    adaptive cut). Smooth, text-free areas stay clean white (no speckle)."""
+    method = (method or "contrast").lower()
     if method == "otsu":
         return threshold_otsu(gray)
     r = max(8, int(round(vdpi / 12)))    # window ~ half a body-text x-height
     g = gray.astype(np.float64)
     mean, std = _local_mean_std(gray, r)
-    if method == "bradley":
+    if method == "contrast":
+        # Additive local-paper threshold (high recall on light text). Near-white
+        # paper has mean ~250, so anything more than ~5% below it goes black; in
+        # truly flat areas pixel ~= mean so nothing flips -> no background noise.
+        thr = mean - 13.0
+    elif method == "bradley":
         thr = mean * (1.0 - 0.15)
     elif method == "niblack":
         thr = mean - 0.2 * std
@@ -258,12 +307,53 @@ def binarize_text(gray: np.ndarray, method: str, vdpi: int) -> np.ndarray:
         R = std.max() if std.max() > 1e-6 else 1.0
         M = float(g.min())
         thr = mean - 0.5 * (1.0 - std / R) * (mean - M)
-    else:  # sauvola (default)
+    else:  # sauvola
         R, k = 128.0, 0.34
         thr = mean * (1.0 + k * (std / R - 1.0))
     black = g <= thr
     black |= _solid_fill_mask(g, mean)
     return np.where(black, 0, 255).astype(np.uint8)
+
+
+def text_in_image_mask(gray: np.ndarray, vdpi: int) -> np.ndarray:
+    """Detect text *baked into a photo* (captions, signs, screenshots, labels, a
+    whole page scanned as one image) so it can be kept legible instead of being
+    halftoned into mush.
+
+    Text strokes are thin, high-contrast and arranged in roughly horizontal runs.
+    A top-hat / black-hat (morphological) response isolates thin light/dark
+    structures while suppressing smooth photo gradients; we keep only strong
+    responses, group them into horizontal lines, and accept components whose
+    geometry looks like a text line (wide, short, reasonably dense). This is
+    deliberately conservative — it would rather miss faint text than carve harsh
+    black blobs out of ordinary photo detail."""
+    g = gray
+    sw = max(2, int(round(vdpi / 90)))            # ~ stroke-width scale (px)
+    k_stroke = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * sw + 1, 2 * sw + 1))
+    resp = np.maximum(cv2.morphologyEx(g, cv2.MORPH_BLACKHAT, k_stroke),  # dark text
+                      cv2.morphologyEx(g, cv2.MORPH_TOPHAT, k_stroke))    # light text
+    strokes = (resp >= 45).astype(np.uint8)        # strong-contrast strokes only
+    kw = max(6, int(round(vdpi / 14)))
+    lines = cv2.morphologyEx(
+        strokes, cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (kw, 1)))
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(lines, 8)
+    out = np.zeros_like(lines)
+    min_w = max(int(vdpi / 6), 16)
+    max_h = int(vdpi * 0.5)
+    for i in range(1, n):
+        x, y, w, h, area = stats[i]
+        if w < min_w or h < 3 or h > max_h:
+            continue
+        if w / float(h) < 2.2:                     # text lines are wide, not blobby
+            continue
+        if area / float(w * h) < 0.30:
+            continue
+        out[labels == i] = 1
+    if out.any():                                  # expand from edges to glyph bodies
+        out = cv2.dilate(
+            out, cv2.getStructuringElement(cv2.MORPH_RECT, (3 * sw, 2 * sw)))
+    return out.astype(bool)
 
 
 def _solid_fill_mask(g: np.ndarray, mean: np.ndarray,
@@ -581,6 +671,12 @@ def dither_line(gray: np.ndarray, hdpi: int = 204, vdpi: int = 196,
 # eye. (ordered/edd/jarvis/stucki/sierra are also selectable via --dither.)
 COMPARE_METHODS = ["clustered", "green-noise", "blue-noise", "atkinson",
                    "floyd", "line"]
+# When both reference panels (original color + true grayscale) are shown first,
+# use four halftone options so the sheet stays a clean 6-up: an AM screen, the
+# AM-FM hybrid, an FM/blue-noise stipple, and the woodcut line screen.
+COMPARE4_METHODS = ["clustered", "green-noise", "blue-noise", "line"]
+# Backwards-compatible alias.
+COMPARE5_METHODS = COMPARE4_METHODS
 # Backwards-compatible alias for older callers.
 TOP5_METHODS = COMPARE_METHODS
 
@@ -758,6 +854,12 @@ def _apply_dither(gray, mask, dither_name, opt, hdpi, vdpi) -> np.ndarray:
         sub = pre_sharpen(sub, vdpi)
     sub = apply_tone_curve(sub, dither_name, opt.tone_curve)
     sub_ht = halftone(sub, dither_name, hdpi, vdpi, opt.green_noise_coarseness)
+    if opt.text_in_image:
+        # Rescue text baked into the photo: where strokes form text lines, keep
+        # the legible binarization instead of the halftone so it stays readable.
+        tmask = text_in_image_mask(gray[y0:y1, x0:x1], vdpi)
+        if tmask.any():
+            sub_ht = np.where(tmask, text_bw[y0:y1, x0:x1], sub_ht)
     bw = text_bw.copy()
     sub_mask = mask[y0:y1, x0:x1]
     region = bw[y0:y1, x0:x1]
@@ -905,17 +1007,61 @@ def _oswald_font(size: int, weight: str = "Bold"):
     return _load_font(size)
 
 
+def _helvetica_font(size: int):
+    """Use Helvetica for subheads when available, with close system fallbacks."""
+    from PIL import ImageFont
+    for name in ("Helvetica.ttf", "Arial.ttf", "arial.ttf",
+                 "LiberationSans-Regular.ttf", "DejaVuSans.ttf"):
+        try:
+            return ImageFont.truetype(name, size)
+        except Exception:
+            continue
+    return _load_font(size)
+
+
+def _draw_wrapped_text(draw, xy, text, font, fill, max_width, line_gap=4):
+    """Draw text wrapped to max_width and return the next y coordinate."""
+    words = text.split()
+    lines, line = [], ""
+    for word in words:
+        candidate = word if not line else f"{line} {word}"
+        if draw.textbbox((0, 0), candidate, font=font)[2] <= max_width:
+            line = candidate
+        else:
+            if line:
+                lines.append(line)
+            line = word
+    if line:
+        lines.append(line)
+    x, y = xy
+    for line in lines:
+        draw.text((x, y), line, font=font, fill=fill)
+        box = draw.textbbox((x, y), line, font=font)
+        y += (box[3] - box[1]) + line_gap
+    return y
+
+
+def _project_asset_path(name: str) -> Optional[str]:
+    """Find optional project-only artwork used for README/GitHub examples."""
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    for folder in ("00_project_files", "00_Project_Files"):
+        path = os.path.join(root, folder, name)
+        if os.path.exists(path):
+            return path
+    return None
+
+
 def _compose_contact_sheet(panels, metrics, recommended, cell_w=480):
     """panels: list of (method_name, PIL '1' image). Returns an RGB contact
     sheet with a labeled, metric-annotated panel per method."""
     from PIL import ImageDraw
     rendered = []
     for name, img in panels:
-        rgb = img.convert("L").convert("RGB")
+        rgb = img.convert("RGB")          # keep color references in color
         ch = max(1, int(rgb.height * (cell_w / rgb.width)))
         rendered.append((name, rgb.resize((cell_w, ch), Image.LANCZOS)))
 
-    cap, pad, title_h = 58, 18, 150
+    cap, pad, title_h = 58, 18, 230
     cols = 3 if len(rendered) > 4 else max(1, len(rendered))
     rows = (len(rendered) + cols - 1) // cols
     cell_h = max(r.height for _, r in rendered)
@@ -923,31 +1069,59 @@ def _compose_contact_sheet(panels, metrics, recommended, cell_w=480):
     H = title_h + rows * (cell_h + cap + pad) + pad
     canvas = Image.new("RGB", (W, H), (244, 244, 244))
     d = ImageDraw.Draw(canvas)
-    title_f = _oswald_font(76, "Bold")
-    sub_f = _oswald_font(30, "Medium")
+    title_f = _oswald_font(74, "Medium")
+    subhead_f = _helvetica_font(24)
     lf, sf = _oswald_font(22, "SemiBold"), _load_font(15)
-    # Heavy Oswald display title to match the project logo, then a subtitle that
-    # keeps the "eye tokens" framing.
-    d.text((pad, 14), "FAX-OPTIMIZED HALFTONES", font=title_f, fill=(15, 15, 15))
-    d.text((pad + 2, 104),
-           "Spend your eye tokens \u2014 pick the panel that reads best after a "
-           "1-bit Group-3 transmission.", font=sub_f, fill=(96, 96, 96))
+
+    # README one-sheet masthead. Uses project-only artwork when present, while
+    # still letting the packaged skill generate comparison sheets without it.
+    d.rectangle([0, 0, W, title_h - 8], fill=(255, 255, 255))
+    logo_path = _project_asset_path("logo_1sheet.png")
+    text_x = pad
+    if logo_path:
+        try:
+            logo = Image.open(logo_path).convert("RGBA")
+            logo_h = min(196, logo.height)
+            logo_w = round(logo.width * (logo_h / logo.height))
+            logo = logo.resize((logo_w, logo_h), Image.LANCZOS)
+            canvas.paste(logo, (pad, 0), logo)
+            text_x = pad + logo_w + 18
+        except Exception:
+            text_x = pad
+    d.text((text_x, 22), "Text That Survives the Fax",
+           font=title_f, fill=(0, 0, 0))
+    _draw_wrapped_text(
+        d, (text_x + 2, 126),
+        "MRC-lite segmentation keeps your text crisp and undithered while "
+        "photos get the halftone treatment, so the page that lands on the "
+        "receiving machine is one a human can actually read.",
+        subhead_f, (45, 45, 45), W - text_x - pad, line_gap=6)
 
     for i, (name, rgb) in enumerate(rendered):
         r, c = divmod(i, cols)
         x = pad + c * (cell_w + pad)
         y = title_h + r * (cell_h + cap + pad)
-        is_rec = (name == recommended)
-        d.rectangle([x, y, x + cell_w, y + cap],
-                    fill=(206, 234, 206) if is_rec else (228, 228, 228))
-        d.text((x + 10, y + 6),
-                name.upper() + ("   >> RECOMMENDED <<" if is_rec else ""),
-                font=lf, fill=(10, 10, 10))
         m = metrics.get(name, {})
-        d.text((x + 10, y + 34),
-                f"{m.get('encoded_bytes', 0) / 1024:.0f} KB  \u00b7  "
-                f"~{m.get('est_transmission_s', 0):.0f}s / page",
-                font=sf, fill=(70, 70, 70))
+        is_orig = bool(m.get("original"))
+        is_rec = (name == recommended) and not is_orig
+        if is_orig:
+            header = (210, 222, 240)        # neutral blue for the source panel
+        elif is_rec:
+            header = (206, 234, 206)
+        else:
+            header = (228, 228, 228)
+        d.rectangle([x, y, x + cell_w, y + cap], fill=header)
+        label = (m.get("label", name.upper()) if is_orig
+                 else name.upper() + ("   >> RECOMMENDED <<" if is_rec else ""))
+        d.text((x + 10, y + 6), label, font=lf, fill=(10, 10, 10))
+        if is_orig:
+            d.text((x + 10, y + 34), m.get("note", "source \u00b7 not a fax"),
+                   font=sf, fill=(70, 70, 70))
+        else:
+            d.text((x + 10, y + 34),
+                   f"{m.get('encoded_bytes', 0) / 1024:.0f} KB  \u00b7  "
+                   f"~{m.get('est_transmission_s', 0):.0f}s / page",
+                   font=sf, fill=(70, 70, 70))
         canvas.paste(rgb, (x, y + cap))
         d.rectangle([x, y, x + cell_w, y + cap + rgb.height],
                     outline=(38, 148, 38) if is_rec else (178, 178, 178),
@@ -956,12 +1130,19 @@ def _compose_contact_sheet(panels, metrics, recommended, cell_w=480):
 
 
 def render_comparison(in_pdf: str, page_no: int, out_png: str, opt: FaxOptions,
-                      methods=None) -> dict:
+                      methods=None, include_original: bool = False) -> dict:
     """Render one page through several halftone methods into a single contact
     sheet, annotated with per-method G4 size + transmission estimate and a
     recommended pick, so a human can choose the optimal one by eye ("eye
-    tokens"). Returns a dict of metrics + recommendation."""
-    methods = methods or COMPARE_METHODS
+    tokens"). Returns a dict of metrics + recommendation.
+
+    With include_original, two reference panels are shown first — the original in
+    color (#1) and a true grayscale of it (#2) — and the default method set drops
+    to four halftones so the sheet stays a clean 6-up. The references are not
+    themselves faxes; they show the continuous-tone input each halftone (and the
+    1-bit channel) has to approximate."""
+    if methods is None:
+        methods = COMPARE4_METHODS if include_original else COMPARE_METHODS
     hdpi, vdpi = RESOLUTIONS[opt.resolution]
     doc = fitz.open(in_pdf)
     page = doc[page_no - 1]
@@ -969,6 +1150,22 @@ def render_comparison(in_pdf: str, page_no: int, out_png: str, opt: FaxOptions,
 
     tmpdir = tempfile.mkdtemp(prefix="faxcmp_")
     panels, metrics = [], {}
+    if include_original:
+        color = render_page_color(page, hdpi, vdpi, opt.max_scanline_px)
+        panels.append(("original", Image.fromarray(color, "RGB")))
+        metrics["original"] = {
+            "encoded_bytes": 0, "est_transmission_s": 0.0, "original": True,
+            "label": "ORIGINAL (color)", "note": "color source \u00b7 not a fax",
+            "info": "The original document in color, for reference.",
+        }
+        gray_ref = render_page_gray(page, hdpi, vdpi, opt.max_scanline_px)
+        panels.append(("grayscale", Image.fromarray(gray_ref).convert("L")))
+        metrics["grayscale"] = {
+            "encoded_bytes": 0, "est_transmission_s": 0.0, "original": True,
+            "label": "TRUE GRAYSCALE", "note": "grayscale source \u00b7 not a fax",
+            "info": "True grayscale (desaturated) source — the continuous-tone "
+                    "input each halftone below approximates.",
+        }
     for m in methods:
         bw = _postclean(_apply_dither(gray, mask, m, opt, hdpi, vdpi), opt)
         img = Image.fromarray(bw.astype(np.uint8)).convert("1")
@@ -983,10 +1180,10 @@ def render_comparison(in_pdf: str, page_no: int, out_png: str, opt: FaxOptions,
         panels.append((m, img))
 
     rec, reason = recommend_dither(photo_fraction, opt.fax_heavy)
-    if rec not in metrics:  # ensure the recommended panel is shown/highlighted
-        rec = min(metrics, key=lambda k: metrics[k]["encoded_bytes"])
+    if rec not in methods:  # ensure the recommended panel is shown/highlighted
+        rec = min(methods, key=lambda k: metrics[k]["encoded_bytes"])
     _compose_contact_sheet(panels, metrics, rec).save(out_png)
-    smallest = min(metrics, key=lambda k: metrics[k]["encoded_bytes"])
+    smallest = min(methods, key=lambda k: metrics[k]["encoded_bytes"])
     return {
         "page": page_no,
         "already_bilevel": already,

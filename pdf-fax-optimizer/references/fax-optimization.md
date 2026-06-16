@@ -171,13 +171,23 @@ The single biggest quality win is *not treating the whole page the same.* This
 is the idea behind Mixed Raster Content (MRC): classify regions, then route each
 to the right converter.
 
-- **Text & line art** → adaptive binarization (`--text-binarize`, default
-  `sauvola`), kept crisp. Sauvola/Niblack/Wolf/Bradley compute a *per-pixel*
-  threshold from the local mean and standard deviation (via integral images, so
-  O(1)/pixel and no contrib dependency), which holds text together over dark
-  header bars, reverse (white-on-black) type, and uneven scanner illumination
-  where a single global Otsu cut drops glyphs or fills shadows. `otsu` remains
-  available as the global fallback.
+- **Text & line art** → contrast-maximizing binarization (`--text-binarize`,
+  default `contrast`), kept crisp. Text is **never halftoned** — it is
+  thresholded for legibility. The default marks black wherever a pixel is darker
+  than its local paper level by a small additive margin (`mean − ~13`), which has
+  high recall on *light/gray text on white* (it pulls it to solid black rather
+  than dropping it, the failure mode of a conservative multiplicative cut) while
+  leaving flat, text-free areas clean. `sauvola`/`niblack`/`wolf`/`bradley`
+  compute a *per-pixel* threshold from the local mean and standard deviation (via
+  integral images, so O(1)/pixel and no contrib dependency), which holds text
+  together over dark header bars, reverse (white-on-black) type, and uneven
+  scanner illumination where a single global Otsu cut drops glyphs or fills
+  shadows. `otsu` remains available as the global fallback.
+  - **Halftoning stays on image sections only.** The variance photo mask opens
+    with a small kernel first (erasing thin text strokes that fall in the
+    mid-variance band), closes to consolidate the genuine photo interior, then
+    keeps only large connected components — so gray text never gets welded into a
+    photo blob and screened (a top legibility killer).
   - **Solid fills & reverse type** are carried across as *solid* black. Adaptive
     binarizers otherwise misfire on a large dark fill (e.g. a reverse-type header
     bar): inside the fill the local-contrast term pushes the threshold below the
@@ -189,6 +199,16 @@ to the right converter.
   **Never dither text** — dithering destroys edge sharpness and legibility, and
   explodes transition density on exactly the content people most need to read.
 - **Photos / continuous-tone** → halftone per §3.
+- **Text baked into an image** → rescued back to the legibility path. Captions,
+  signs, screenshots and (importantly) a whole page scanned as a single image all
+  put text *inside* the photo region, where a naive pipeline would halftone it
+  into mush. `text_in_image_mask` runs inside the photo region: a top-hat /
+  black-hat response isolates thin high-contrast strokes (suppressing smooth
+  photo gradients), groups them into horizontal runs, and accepts only
+  text-line-shaped components (wide, short, dense). Those pixels keep the
+  binarized value instead of the screen. It is conservative by design — it would
+  rather miss faint text than carve harsh blobs out of ordinary photo detail —
+  and is on by default (`--no-text-in-image` to disable).
 
 The pipeline detects photo regions from the PDF's **embedded raster image
 rectangles** (`page.get_image_rects`) rather than guessing from pixels — robust,
@@ -259,11 +279,13 @@ The output should be cheap and robust to send, not just small on disk:
 | `--fax-resolution` | `fine` | Native dpi; anisotropic, avoids moiré |
 | `--dither` | `auto` | Photo halftone schema (§3); clustered, green-noise, blue-noise, atkinson, floyd, line/woodcut, ordered, edd, jarvis, stucki, sierra, none |
 | `--green-noise-coarseness` | `4.0` | AM↔FM knob for green-noise (~2 detail … 8 robust) (§3) |
-| `--text-binarize` | `sauvola` | Adaptive binarizer for text/line content; niblack, wolf, bradley, otsu (§4) |
+| `--text-binarize` | `contrast` | Binarizer for text/line content; `contrast` forces gray/light text to solid black; also sauvola, niblack, wolf, bradley, otsu (§4) |
 | `--tone-curve` | `auto` | Per-family dot-gain pre-correction so photos don't plug to black (§3) |
 | `--sharpen` | off | Edge-aware unsharp on photo regions before halftoning (§3) |
-| `--compare-page` | none | Render all top-5 schemas to one contact sheet so a human can pick by eye (§3) |
-| `--compare-methods` | top 5 | Override which schemas appear in the comparison |
+| `--no-text-in-image` | (rescue on) | Disable rescue of text baked into photos; halftone the whole image region (§4) |
+| `--compare-page` | none | Render the curated 6-up of schemas to one contact sheet so a human can pick by eye (§3) |
+| `--compare-original` | off | Lead the sheet with original-color (#1) + true-grayscale (#2) references, then four halftones |
+| `--compare-methods` | curated | Override which schemas appear in the comparison |
 | `--fax-heavy` | off | Bias to clustered: compresses + survives noisy lines |
 | `--segmentation` | `embedded` | MRC routing; `variance` for flattened scans |
 | `--thicken` | off | Save hairlines/small fonts from vanishing (§5) |

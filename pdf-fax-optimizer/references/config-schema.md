@@ -23,8 +23,12 @@ omitted keys fall back to the documented defaults.
     "fax_heavy": false,           // bias toward clustered (compresses, robust)
 
     // ---- text / line-art binarization (never halftoned) ----
-    "text_binarize": "sauvola",   // "sauvola" | "niblack" | "wolf" | "bradley"
-                                  //   | "otsu" (adaptive document binarizers)
+    "text_binarize": "contrast",  // "contrast" (force gray/light text to solid
+                                  //   black) | "sauvola" | "niblack" | "wolf"
+                                  //   | "bradley" | "otsu"
+    "text_in_image": true,        // rescue text baked into photos (captions,
+                                  //   signs, scanned-as-one-image) so it stays
+                                  //   legible instead of being halftoned
     "segmentation": "embedded",   // "embedded" (use PDF image rects)
                                   //   | "variance" (heuristic for flat scans)
                                   //   | "none" (whole page one strategy)
@@ -86,7 +90,7 @@ The `report` file (and `--report`) is written as JSON:
       "photo_regions": 1,
       "photo_fraction": 0.19,
       "dither": "green-noise",
-      "text_binarize": "sauvola",
+      "text_binarize": "contrast",
       "already_bilevel": false,
       "warnings": ["small_text_below_min", "wash_out_color:yellow"]
     }
