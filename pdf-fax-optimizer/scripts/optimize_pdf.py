@@ -17,6 +17,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fax_pipeline as fax  # noqa: E402
+import fitz  # noqa: E402  # for the deck-page-count line of the progress print
 
 
 def load_config(path):
@@ -33,7 +34,7 @@ def build_fax_options(cfg, args) -> fax.FaxOptions:
         return flag if flag is not None else fc.get(key, default)
 
     return fax.FaxOptions(
-        resolution=pick(args.fax_resolution, "resolution", "fine"),
+        resolution=pick(args.fax_resolution, "resolution", fax.DEFAULT_RESOLUTION),
         dither=pick(args.dither, "dither", "auto"),
         fax_heavy=args.fax_heavy or fc.get("fax_heavy", False),
         segmentation=pick(args.segmentation, "segmentation", "embedded"),
@@ -49,10 +50,12 @@ def build_fax_options(cfg, args) -> fax.FaxOptions:
         green_noise_coarseness=pick(args.green_noise_coarseness,
                                     "green_noise_coarseness", 4.0),
         text_in_image=pick(args.text_in_image, "text_in_image", True),
-        robust_image_text=pick(args.robust_text, "robust_image_text", "auto"),
-        robust_text_stroke=pick(args.robust_text_stroke, "robust_text_stroke", 0.15),
-        ocr_text=pick(args.ocr_text, "ocr_text", "off"),
-        ocr_conf_min=pick(args.ocr_conf, "ocr_conf_min", 0.6),
+        robust_image_text=pick(args.robust_text, "robust_image_text", "off"),
+        ocr_text=pick(args.ocr_text, "ocr_text", "auto"),
+        ocr_conf_min=pick(args.ocr_conf, "ocr_conf_min", 0.5),
+        transmission_safe=(args.transmission_safe
+                           or fc.get("transmission_safe", False)),
+        basic=(args.basic or fc.get("basic", False)),
     )
 
 
@@ -93,32 +96,56 @@ def main():
                         "image region (text-in-image rescue is on by default)")
     p.add_argument("--robust-text", choices=["auto", "on", "off"], default=None,
                    dest="robust_text",
-                   help="rescue washout-prone COLORED text (e.g. yellow on cyan) "
-                        "that grayscale loses: detect by chroma, recolor to solid "
-                        "black-on-white, and self-verify legibility. 'auto' "
-                        "(default) acts only when such text is found; 'on' scans "
-                        "more aggressively; 'off' disables")
+                   help="rescue text baked INSIDE images (signage, captions): OCR "
+                        "locates words; each word's ORIGINAL glyph pixels are "
+                        "recoloured BLACK on a light/mid field or WHITE on a dark "
+                        "field by the #808080 rule, and the recoloured glyphs ride "
+                        "a layer composited ABOVE the halftone (so the screen can "
+                        "never disturb them). **Off by default** — pass "
+                        "`--robust-text on` (or `auto` to enable when an OCR engine "
+                        "is available) to opt in")
     p.add_argument("--robust-text-stroke", type=float, default=None,
                    dest="robust_text_stroke", metavar="MULT",
-                   help="thickness of the contrasting stroke drawn behind rescued "
-                        "text, as a multiple of glyph height (default 0.15). Only "
-                        "applied where the background is too dark for solid-black "
-                        "text on its own; light/mid backgrounds get no backing")
+                   help="(deprecated, retained for back-compat: glyphs now ride a "
+                        "compositing layer so a stroke backing isn't needed)")
     p.add_argument("--robust-text-preview", type=int, default=None,
                    metavar="PAGE",
                    help="write a before/after contact sheet for PAGE showing the "
-                        "page faxed WITHOUT vs WITH robust-text recolor")
+                        "page faxed WITHOUT vs WITH within-image robust-text recolor")
+    p.add_argument("--sample", type=int, default=None, metavar="PAGE",
+                   help="write a 4-panel sample sheet for PAGE — original colour, "
+                        "grayscale, halftone-on-image-areas, and full pipeline "
+                        "(robust text on) — so the recolour and halftone effects "
+                        "can be inspected side by side")
     p.add_argument("--ocr-text", choices=["off", "auto", "on"], default=None,
                    dest="ocr_text",
-                   help="RECOGNISE text baked into images (OCR) and re-typeset it "
-                        "crisply, recovering words the signal path can't (e.g. a "
-                        "sign word lost to near-zero contrast). Off by default; "
-                        "needs an OCR engine (rapidocr-onnxruntime). OCR can misread "
-                        "— verify recognised words in the report/preview")
+                   help="Within the OCR pass, control whether OUTSIDE-image "
+                        "text (header/footer/form) is also recoloured by the "
+                        "#808080 rule. Only meaningful when --robust-text is "
+                        "on; the OCR engine is shared and ONLY runs at all if "
+                        "--robust-text is on (it is the slow step — 20+ min on "
+                        "a 6-page 391-DPI deck — and the chroma-aware photo "
+                        "segmenter plus the adaptive binarizer route doc text "
+                        "correctly without it). Needs rapidocr-onnxruntime")
     p.add_argument("--ocr-conf", type=float, default=None, dest="ocr_conf",
                    metavar="C",
-                   help="minimum OCR confidence (0–1) to re-typeset a word "
+                   help="minimum OCR confidence (0–1) to recolour a word "
                         "(default 0.5)")
+    p.add_argument("--basic", action="store_true",
+                   help="bare-minimum pipeline: render to grayscale at the "
+                        "source's effective DPI and Otsu-threshold to 1-bit. "
+                        "No MRC photo segmentation, no OCR, no halftoning, no "
+                        "flatten_bg / despeckle / deskew / thicken — just the "
+                        "minimum steps to land a 1-bit page in a G4 frame. "
+                        "Use as a baseline reference, or when the full "
+                        "pipeline's enhancements are unwanted (e.g. for "
+                        "synthetic / already-flat documents). "
+                        "--transmission-safe still applies")
+    p.add_argument("--transmission-safe", action="store_true",
+                   help="clamp the rendered scanline to 1728 px so a real Group-3 "
+                        "fax machine can transmit the file. Without this, the "
+                        "output is rendered at the source's native resolution "
+                        "(best legibility) but may exceed standard fax widths")
     p.add_argument("--fax-heavy", action="store_true")
     p.add_argument("--segmentation",
                    choices=["embedded", "variance", "none"], default=None)
@@ -218,11 +245,36 @@ def main():
             src_pdf, args.robust_text_preview, png, opt)
         rt = rtp.get("robust_text") or {}
         print(f"Robust-text before/after: {png}")
-        print(f"  regions detected: {rt.get('regions_detected', 0)}, "
-              f"recovered: {rt.get('regions_recovered', 0)}, "
-              f"unrecovered: {rt.get('regions_unrecovered', 0)}")
+        print(f"  words recognised: {rt.get('words_recognized', 0)}, "
+              f"recoloured black: {rt.get('words_recolored_black', 0)}, "
+              f"recoloured white: {rt.get('words_recolored_white', 0)}")
 
-    report = fax.convert_pdf(src_pdf, args.output, opt)
+    if args.sample:
+        png = os.path.splitext(args.output)[0] + f".sample_p{args.sample}.png"
+        spl = fax.render_sample(src_pdf, args.sample, png, opt)
+        rt = spl.get("robust_text") or {}
+        di = spl.get("doc_text") or {}
+        print(f"4-panel sample: {png}")
+        if di.get("words"):
+            print(f"  document text: {len(di['words'])} word(s) recoloured by "
+                  "#808080")
+        if rt.get("words"):
+            print(f"  image text:    {rt.get('words_recolored_black', 0)} black + "
+                  f"{rt.get('words_recolored_white', 0)} white "
+                  "by #808080")
+
+    def _progress(i, n, rep):
+        # One line per page, flushed immediately, so a long deck doesn't go
+        # silent for minutes. The size + dither + transmission read tells the
+        # user the page actually came out (and roughly how big it'll be);
+        # the page count anchors it within the deck.
+        kb = rep.encoded_bytes / 1024
+        print(f"  page {i}/{n}: {kb:6.1f} KB  dither={rep.dither}  "
+              f"~{rep.est_transmission_s:.0f}s tx", flush=True)
+
+    print(f"converting {src_pdf} ({fitz.open(src_pdf).page_count} pages)...",
+          flush=True)
+    report = fax.convert_pdf(src_pdf, args.output, opt, progress=_progress)
     # Report against the original file the user handed us, not the intermediate.
     report["input"] = args.input
     report["input_bytes"] = os.path.getsize(args.input)
@@ -275,24 +327,28 @@ def _print_summary(report):
     binar = sorted({p.get("text_binarize", "") for p in report["pages"]} - {""})
     if binar:
         print(f"text binarizer: {', '.join(binar)}")
-    rt_det = sum((p.get("robust_text") or {}).get("regions_detected", 0)
-                 for p in report["pages"])
-    if rt_det:
-        rt_rec = sum((p.get("robust_text") or {}).get("regions_recovered", 0)
-                     for p in report["pages"])
-        rt_un = sum((p.get("robust_text") or {}).get("regions_unrecovered", 0)
-                    for p in report["pages"])
-        print(f"robust image text: {rt_det} colored region(s) detected, "
-              f"{rt_rec} recolored for contrast"
-              + (f", {rt_un} left as-is (no rescue needed)" if rt_un else ""))
-    ocr_words = [w for p in report["pages"]
-                 for w in (p.get("ocr_text") or {}).get("words", [])]
-    if ocr_words:
-        shown = ", ".join(f"“{w['text']}”({w['conf']:.2f})"
-                          for w in ocr_words[:8])
-        more = "" if len(ocr_words) <= 8 else f", +{len(ocr_words) - 8} more"
-        print(f"OCR text recovered: {len(ocr_words)} word(s) re-typeset — "
-              f"{shown}{more}  (verify these are correct)")
+    def _summarise(words, label_scope):
+        if not words:
+            return
+        rendered = [w for w in words if w.get("rendered", True)]
+        nb_rend = sum(1 for w in rendered if w.get("polarity") == "black")
+        nw_rend = sum(1 for w in rendered if w.get("polarity") == "white")
+        if not rendered:
+            print(f"{label_scope} text: {len(words)} word(s) read; binarizer "
+                  "rendering preserved (no recolour needed)")
+            return
+        shown = ", ".join(f"\u201c{w['text']}\u201d({w['polarity'][0]})"
+                          for w in rendered[:8])
+        more = "" if len(rendered) <= 8 else f", +{len(rendered) - 8} more"
+        skipped = len(words) - len(rendered)
+        skip_note = f" ({skipped} on white field left to binarizer)" if skipped else ""
+        print(f"{label_scope} text recoloured (#808080 rule): {nb_rend} black + "
+              f"{nw_rend} white{skip_note} — {shown}{more}")
+
+    _summarise([w for p in report["pages"]
+                for w in (p.get("robust_text") or {}).get("words", [])], "image")
+    _summarise([w for p in report["pages"]
+                for w in (p.get("ocr_text") or {}).get("words", [])], "document")
     print(f"est. transmission: {report['total_est_transmission_s']:.0f}s "
           f"(~{report['total_est_transmission_s'] / 60:.1f} min)")
     if report.get("comparison"):

@@ -32,12 +32,17 @@ transmission and **arrives legible on the receiving machine.**
 > **[pdf-email-optimizer](https://github.com/petehottelet/pdf-email-optimizer)**.
 
 To make a fax legible, the skill models the Group-3 constraint (1-bit,
-anisotropic resolution, run-length compression along each scanline) and does
-MRC-lite segmentation — crisp hard-thresholded text, halftoned photos — instead
-of dithering the whole page into mud. It defends fine detail (background flatten,
-despeckle, deskew, optional stroke thickening), warns about content that won't
-survive bilevel, and lets you **preview exactly what will be transmitted** so
-you can confirm it's readable before sending.
+run-length compression along each scanline) and runs an OCR-driven, layered
+pipeline: it renders at the **source's native resolution with square pixels**
+(no aspect distortion, no down-scaling), segments image areas, runs OCR over
+the page, and recolors **every recognised word's glyphs to SOLID BLACK or SOLID
+WHITE by a single bright-line rule — median field luminance vs `#808080`**.
+The recoloured glyphs ride a **text layer composited above** the halftoned
+image layer, so the screen can never disturb them. It defends fine detail
+(background flatten, despeckle, deskew, optional stroke thickening), warns
+about content that won't survive bilevel, and lets you **preview exactly what
+will be transmitted** with a 4-panel sample sheet so you can confirm it's
+readable before sending.
 
 The `SKILL.md` format is an open standard. This skill is built and tested for
 **Claude** (Claude Code / claude.ai) and **OpenAI Codex**.
@@ -46,20 +51,31 @@ The `SKILL.md` format is an open standard. This skill is built and tested for
 
 - Accepts **PDF, Word, PowerPoint, Excel, OpenDocument, text, and image** input,
   normalizing non-PDF formats to PDF first (see *Input formats* below).
-- Rasterizes each page at a fax-native resolution (`standard` 204×98, `fine`
-  204×196, `superfine` 204×391), resampling axes independently and clamping the
-  scanline to 1728 px.
-- MRC-lite segmentation using the PDF's embedded-image rectangles: text/line-art
-  → hard threshold; photos → halftone. **Text found *inside* an image** (a
-  flattened page, screenshot, caption, or sign) is detected, segmented out, and
-  kept crisp instead of being halftoned with the picture around it.
+- Rasterizes each page at the **source's native resolution with square pixels**
+  — raster sources (PNG, JPG, scans) come through pixel-for-pixel with their
+  original aspect ratio; vector sources rasterize square at the
+  `--fax-resolution` preset (default **`superfine`**).
+- MRC-lite segmentation using the PDF's embedded-image rectangles: photos go to
+  halftone, document text goes to an adaptive binarizer, with a guard for
+  full-page rasters so the document's own text never gets dithered.
+- **OCR-driven text recolor** (default on): `rapidocr-onnxruntime` locates
+  every word — outside images (`--ocr-text`) and, with `--robust-text`, inside
+  images — and the pipeline marks each word BLACK or WHITE by the **#808080
+  rule** (median field luma < 128 → WHITE; ≥ 128 → BLACK). The recoloured
+  glyphs ride a layer composited **above** the halftone, so the screen can
+  never disturb them.
 - Pre-cleans: background flatten, despeckle, deskew; optional stroke thickening
   to save hairlines and small fonts.
 - Emits lossless CCITT-G4 (no re-encode) via img2pdf — a `CCITTFaxDecode` PDF or
-  a Class-F multipage TIFF.
-- Produces a JSON report with **estimated transmission time per page** and
-  legibility/inversion warnings, plus a `--preview-page` PNG of exactly what
-  will be transmitted.
+  a Class-F multipage TIFF, with the (square) effective DPI embedded so the
+  output PDF is correctly proportioned.
+- `--transmission-safe` clamps the final scanline to 1728 px when you need
+  strict Group-3 transmissibility (default keeps native resolution for
+  legibility).
+- Produces a JSON report with **estimated transmission time per page**, every
+  recoloured word and its polarity, and legibility/inversion warnings — plus
+  `--sample N` for a 4-panel preview sheet (original / grayscale /
+  halftone-only / halftone+robust-text).
 
 ## Optimizing for the channel, not "fax-ifying" the document
 
@@ -81,44 +97,39 @@ like a generic fax. The skill treats a page as Mixed Raster Content and applies 
   to the legibility path, so it stays readable instead of dissolving into a
   halftone screen (`--no-text-in-image` to disable). See the next section.
 
-### Text inside images — found, separated, and kept legible
+### Text inside images — found, recolored by the #808080 rule, kept legible
 
 Plenty of real fax jobs are full of text that *isn't* live text: a whole page
-exported or scanned as a single image, a screenshot, a caption or label burned
-into a photo, a sign in a snapshot. If that page were treated as one big picture
-and halftoned, the words would dissolve into dot-screen mud — the exact failure
-this skill exists to prevent. So the pipeline never stops at "photo vs.
-not-photo"; it looks **inside** every photo region for text and pulls it back
-onto the legibility path. Four steps:
+exported or scanned as a single image, a screenshot, a caption burned into a
+photo, a sign in a snapshot. If that page were treated as one big picture and
+halftoned, the words would dissolve into dot-screen mud. The pipeline therefore
+runs **OCR over every page** and recolors text by a single bright-line rule —
+the **#808080 rule** — and never lets the halftone touch a glyph:
 
-1. **Identify the text within the image.** A morphological top-hat / black-hat
-   filter (scaled to the fax DPI) isolates thin, high-contrast strokes — light
-   text *or* dark — while ignoring the smooth tonal gradients of a real
-   photograph.
-2. **Segment it properly.** Strong stroke responses are grouped into horizontal
-   runs and passed through connected-component analysis, keeping only components
-   whose geometry actually reads as a line of text (wide, short, reasonably
-   dense), then dilated from the stroke edges out to full glyph bodies. The
-   detector is deliberately conservative — it would rather miss faint text than
-   carve hard black blobs out of ordinary photo detail.
-3. **Treat the text separately.** Inside the photo region, the detected text
-   pixels are routed to the same **text binarizer** used for live text
-   (`--text-binarize`, `contrast` by default) and rendered as crisp solid black,
-   while everything around them is still halftoned for the channel. The
-   two are composited back together, so one image can carry sharp text *and* a
-   properly screened photo at the same time.
-4. **Enhance it if needed.** The binarizer pulls gray and light-gray lettering
-   up to solid black instead of dropping it; `--thicken` rescues hairline strokes
-   and sub-minimum fonts that would otherwise vanish at low DPI; reverse
-   (white-on-black) type and solid fills are carried across intact rather than
-   hollowed out.
+1. **Locate every word.** OCR (`rapidocr-onnxruntime`) finds words in two
+   scopes: OUTSIDE the image regions (`--ocr-text` — the page's
+   header/footer/form text) and, with `--robust-text`, INSIDE the image regions
+   (signage, captions). OCR is the locator only; if the engine isn't installed
+   the skill falls back to the binarizer's default black-on-white.
+2. **Segment the original glyph pixels.** Each word's OCR box is used to crop;
+   glyphs are split from their field using the box's border ring (definitely
+   field) — robust where a blind 2-means split would invert. The real
+   letterforms are preserved; no synthetic font is ever pasted.
+3. **Pick polarity per the #808080 rule.** Median field luminance < 128
+   ⇒ glyphs become **WHITE**; ≥ 128 ⇒ glyphs become **BLACK**. Polarity is
+   decided **per sign** (words grouped by proximity, one field tone for the
+   whole group) so co-located words on the same plate get one consistent
+   treatment.
+4. **Composite text ABOVE the halftone.** The recoloured glyphs ride a text
+   layer painted on top of the halftoned image layer, so the halftone screen
+   can never disturb them. No field-lift, no field-darken, no stroke backing —
+   the layered composite makes those obsolete.
 
-The payoff: **even when the rest of an image is aggressively optimized for fax
-transmission, the words inside it stay legible.** This is exactly what happens
-with a flattened, "printed-to-image" PDF whose entire page is a single raster —
-the body copy, headings, and tables are detected and kept crisp while only the
-genuine photographs on the page are halftoned. (Turn the behavior off with
-`--no-text-in-image`.)
+The payoff: **even when an image is aggressively halftoned for transmission,
+every word inside it stays legible** — and the report lists each recoloured
+word with its OCR confidence, polarity, and field luminance so you can verify.
+A `--no-text-in-image` fallback is also available for the rare case where you
+want pure halftone everywhere.
 
 ### Halftone schemas + the "eye tokens" comparison preview
 
@@ -140,9 +151,10 @@ with clustered-dot run-length/robustness, tunable via `--green-noise-coarseness`
 (~2 detail … 8 robust). `line`/`woodcut` renders tone as horizontal stripes that
 thicken with darkness — because the strokes run *along the scanline* it is the
 most G4-friendly way to carry a photo and reads as a clean engraving, never mud.
-All screen schemas are **anisotropically tuned** from the fax DPI so dots stay
-round on paper. (`ordered`, `edd` edge-enhancing diffusion, `jarvis`, `stucki`,
-`sierra`, and `none`/threshold are also selectable.)
+Because the pipeline runs at square pixels, the screens are isotropic by
+construction — dots stay round on paper without any anisotropic correction.
+(`ordered`, `edd` edge-enhancing diffusion, `jarvis`, `stucki`, `sierra`, and
+`none`/threshold are also selectable.)
 
 Compression can be ranked by a machine, but **readability can't** — only a human
 eye can decide whether a halftone "reads." So `--compare-page N` renders one page
@@ -154,31 +166,26 @@ the contact sheet — then re-run with the chosen `--dither` for the final file.
 
 ```bash
 python pdf-fax-optimizer/scripts/optimize_pdf.py input.pdf -o output.fax.pdf \
-    --fax-resolution fine --compare-page 1
+    --compare-page 1
 # -> writes output.fax.compare_p1.png (a 6-up of clustered/green-noise/
 #    blue-noise/atkinson/floyd/line so you can pick the panel that reads best)
 
 # Add --compare-original to lead with two reference panels — the original in
 # color (#1) and a true grayscale of it (#2) — followed by four halftones:
 python pdf-fax-optimizer/scripts/optimize_pdf.py input.pdf -o output.fax.pdf \
-    --fax-resolution fine --compare-page 1 --compare-original
+    --compare-page 1 --compare-original
 ```
 
 ### Text That Survives the Fax
 
-MRC-lite segmentation keeps your text crisp and undithered while photos get the
-halftone treatment, so the page that lands on the receiving machine is one a
-human can actually read.
-
-**Robust image text** goes further for *colored* text that a grayscale fax
-silently loses — think yellow lettering on a cyan sign, where the two map to
-nearly the same luminance and the words dissolve the moment the page is
-desaturated. `--robust-text` (on by default) detects such text by its *chroma*,
-recolors it to solid black, and adds a clean contrasting backing only where the
-background is too dark to carry it — then verifies the result is legible in the
-actual 1-bit output. In the comparison below, watch the **VILLA DEL SOL** sign:
-readable in the color original, *gone* in the true-grayscale reference, and
-brought back to solid, legible black in every fax halftone.
+The OCR-driven #808080 rule keeps every word on the page legible — outside
+images (page header/footer/form text) and inside images (signage, captions
+baked into a photo). Each word's ORIGINAL glyph pixels are recoloured BLACK on
+a light/mid field or WHITE on a dark field, then composited **above** the
+halftone so the screen never disturbs them. In the comparison below, watch the
+**VILLA DEL SOL** sign: readable in the color original, washed out in the
+true-grayscale reference, and brought back to solid black on the cyan/gold/tan
+covers because OCR finds the words and the #808080 rule paints them.
 
 <p align="center">
   <img src="docs/compare_example.png" alt="Six-panel fax comparison showing original color, true grayscale washing out the colored sign text, and four fax halftone treatments with the text rescued to solid black" width="100%">
@@ -197,12 +204,11 @@ fax pipeline:
 - **PDF** — used as-is
 
 ```bash
-# Fax a Word doc directly
-python pdf-fax-optimizer/scripts/optimize_pdf.py proposal.docx -o proposal.fax.pdf \
-    --fax-resolution fine --dither auto
+# Fax a Word doc directly (defaults: superfine + OCR-driven #808080 polarity)
+python pdf-fax-optimizer/scripts/optimize_pdf.py proposal.docx -o proposal.fax.pdf
 
-# Fax a scanned image
-python pdf-fax-optimizer/scripts/optimize_pdf.py scan.jpg -o scan.fax.pdf --compare-page 1
+# Fax a scanned image with a 4-panel sample sheet
+python pdf-fax-optimizer/scripts/optimize_pdf.py scan.jpg -o scan.fax.pdf --sample 1
 ```
 
 Images are wrapped to PDF with `img2pdf` (no extra tools). Office/OpenDocument
@@ -242,6 +248,11 @@ retain the intermediate PDF next to the output.
 - **Python 3.9+** with: PyMuPDF, Pillow, numpy, opencv-python-headless, img2pdf
   (`pip install -r requirements.txt`). `requests` is also installed, needed only
   to **send** faxes.
+- **`rapidocr-onnxruntime`** (optional but recommended) — drives the OCR-based
+  #808080 polarity passes (`--ocr-text` and `--robust-text`). Self-contained
+  (bundled ONNX models, no system OCR binary). Without it the skill still
+  works: document text falls back to the binarizer's default black-on-white
+  and the within-image robust pass is silently skipped.
 - **No CLI tools required** for PDF/image input. (qpdf / Ghostscript are optional
   and only useful for unrelated PDF work.)
 - **LibreOffice** (optional) — only needed to fax **Office/OpenDocument** input
@@ -298,18 +309,21 @@ or explicitly via `$pdf-fax-optimizer`. (Codex caps the frontmatter `description
 The scripts are a normal CLI:
 
 ```bash
-# Make a PDF faxable (1-bit CCITT-G4, fine resolution) + report + preview
+# Make a PDF faxable (default: superfine, native res, OCR + #808080 on)
 python pdf-fax-optimizer/scripts/optimize_pdf.py input.pdf -o output.fax.pdf \
-    --fax-resolution fine --dither auto \
-    --report output.report.json --preview-page 1
+    --report output.report.json --sample 1
 
 # Compare the 6-up of halftone methods on page 1 and pick by eye
 python pdf-fax-optimizer/scripts/optimize_pdf.py input.pdf -o output.fax.pdf \
-    --fax-resolution fine --compare-page 1
+    --compare-page 1
+
+# Strict Group-3 transmissibility (1728-px scanline) for a real fax machine
+python pdf-fax-optimizer/scripts/optimize_pdf.py input.pdf -o output.fax.pdf \
+    --transmission-safe
 
 # Multipage Class-F G4 TIFF instead of a PDF
 python pdf-fax-optimizer/scripts/optimize_pdf.py input.pdf -o output.tiff \
-    --format tiff --fax-resolution fine
+    --format tiff
 ```
 
 See `pdf-fax-optimizer/references/config-schema.md` for the full flag/config
@@ -327,9 +341,9 @@ as Telnyx or SRFax). Always pass keys via environment variables, and use
 ```bash
 export MFAX_API_KEY=sk_live_xxx
 
-# optimize and send in one step
+# optimize and send in one step (transmission-safe for real fax lines)
 python pdf-fax-optimizer/scripts/optimize_pdf.py input.pdf -o output.fax.pdf \
-    --fax-resolution fine --dither auto \
+    --transmission-safe \
     --send mfax --to +14155551234 --dry-run     # drop --dry-run to transmit
 
 # or send an already-optimized file

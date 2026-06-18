@@ -9,7 +9,15 @@ omitted keys fall back to the documented defaults.
 ```jsonc
 {
   "fax": {
-    "resolution": "fine",         // "standard" | "fine" | "superfine"
+    "resolution": "superfine",    // "standard" | "fine" | "superfine" (DEFAULT)
+                                  //   raster pages keep their NATIVE pixel grid;
+                                  //   the preset only sets the halftone screen
+                                  //   detail and the rasterization DPI for vector
+                                  //   pages.
+    "transmission_safe": false,   // clamp the final scanline to 1728 px so a real
+                                  //   Group-3 fax can transmit it. Default OFF
+                                  //   prefers legibility (native resolution) over
+                                  //   strict G3 transmissibility.
 
     // ---- photo halftone schema (continuous-tone regions only) ----
     "dither": "auto",             // "auto" | "clustered" | "green-noise"
@@ -26,17 +34,24 @@ omitted keys fall back to the documented defaults.
     "text_binarize": "contrast",  // "contrast" (force gray/light text to solid
                                   //   black) | "sauvola" | "niblack" | "wolf"
                                   //   | "bradley" | "otsu"
-    "text_in_image": true,        // rescue text baked into photos (captions,
-                                  //   signs, scanned-as-one-image) so it stays
-                                  //   legible instead of being halftoned
-    "robust_image_text": "auto",  // rescue washout-prone COLORED text (e.g. yellow
-                                  //   on cyan) that grayscale loses: detect by
-                                  //   chroma, recolor to solid black, add a stroke
-                                  //   only if the bg is too dark, and self-verify.
-                                  //   "auto" acts only when found | "on" scans
-                                  //   harder | "off" disables
-    "robust_text_stroke": 0.15,   // thickness (× glyph height) of the contrasting
-                                  //   stroke used only in the dark-background case
+    "text_in_image": true,        // fallback rescue: where stroke geometry inside
+                                  //   the photo region looks like a text line, keep
+                                  //   the binarized value instead of the halftone.
+                                  //   The OCR-driven robust_image_text below is the
+                                  //   primary path; this is a safety net.
+    "ocr_text": "auto",           // OCR-driven #808080 polarity for text OUTSIDE
+                                  //   images (page header/footer/form text). "auto"
+                                  //   runs when an OCR engine is available; "off"
+                                  //   falls back to the binarizer's default
+                                  //   black-on-white. Needs rapidocr-onnxruntime.
+    "robust_image_text": "auto",  // OCR-driven #808080 polarity for text INSIDE
+                                  //   images (signage, captions baked into a
+                                  //   photo). Same engine as ocr_text; recoloured
+                                  //   glyphs ride a layer composited ABOVE the
+                                  //   halftone so the screen never disturbs them.
+                                  //   "off" disables only the within-image pass.
+    "ocr_conf_min": 0.5,          // minimum OCR confidence to recolour a word
+    "robust_text_stroke": 0.15,   // (deprecated, retained for back-compat)
     "segmentation": "embedded",   // "embedded" (use PDF image rects)
                                   //   | "variance" (heuristic for flat scans)
                                   //   | "none" (whole page one strategy)
@@ -45,7 +60,6 @@ omitted keys fall back to the documented defaults.
     "despeckle": true,            // remove isolated black pixels
     "deskew": true,               // straighten skewed scans
     "format": "pdf",              // "pdf" (CCITT G4 in PDF) | "tiff" (Class-F G4)
-    "max_scanline_px": 1728,      // clamp page width
     "line_rate_bps": 14400,       // basis for transmission-time estimate
     "page_overhead_s": 1.5        // per-page fax handshake/overhead estimate
   },
@@ -55,8 +69,8 @@ omitted keys fall back to the documented defaults.
 }
 ```
 
-> Note: `--compare-page N` and `--compare-methods a,b,c` (the multi-method
-> "eye tokens" contact sheet) are CLI-only flags, not config keys.
+> Note: `--compare-page N`, `--compare-methods a,b,c`, `--sample N`, and
+> `--robust-text-preview N` are CLI-only flags, not config keys.
 
 ## Annotated example — faxing scanned clinical paperwork with a photo
 
@@ -100,17 +114,28 @@ The `report` file (and `--report`) is written as JSON:
       "dither": "green-noise",
       "text_binarize": "contrast",
       "already_bilevel": false,
-      "robust_text": {              // present only when colored text was found
-        "mode": "auto",
-        "regions_detected": 2,
-        "regions_recovered": 2,     // recolored & verified legible
-        "regions_unrecovered": 0,   // reverted (left as the normal pipeline renders)
-        "regions_rejected": 1,      // candidates that weren't text-like (skipped)
-        "details": [ { "bbox": [x0,y0,x1,y1], "ink_before": 0.49,
-                       "ink_after": 0.18, "cover": 0.12, "bg_luma": 163.0,
-                       "backing": "none", "legible": true } ]
+      "ocr_text": {                 // text OUTSIDE images (header/footer/form text)
+        "scope": "doc",
+        "engine": "rapidocr-onnxruntime",
+        "words_recognized": 27,
+        "words_recolored_black": 25,
+        "words_recolored_white": 0,
+        "words": [ { "text": "FAX", "conf": 0.99, "polarity": "black",
+                     "field_gray": 250.0, "wcag_contrast": 18.6,
+                     "bbox": [x0, y0, x1, y1] } ]
       },
-      "warnings": ["small_text_below_min", "robust_text:recovered:2"]
+      "robust_text": {              // text INSIDE images (signage, captions)
+        "scope": "image",
+        "engine": "rapidocr-onnxruntime",
+        "words_recognized": 2,
+        "words_recolored_black": 2, // #808080 rule: field >= 128 -> BLACK
+        "words_recolored_white": 0, // #808080 rule: field < 128 -> WHITE
+        "words": [ { "text": "VILLA DEL SOL", "conf": 0.98,
+                     "polarity": "black", "field_gray": 142.0,
+                     "wcag_contrast": 2.2, "bbox": [x0, y0, x1, y1] } ]
+      },
+      "warnings": ["small_text_below_min", "image_text:recolored:2",
+                   "doc_text:recolored:25"]
     }
   ],
   "total_est_transmission_s": 142.0,
@@ -120,7 +145,8 @@ The `report` file (and `--report`) is written as JSON:
 
 Always surface `total_est_transmission_s`, page count, and any `warnings` to the
 user. Long per-page transmission times and `inverted_or_heavy_black` are the
-signals to revisit knobs before sending. `robust_text:recovered:*` is
-informational — colored text that would have washed out was recolored for contrast
-and verified; per-region detail (incl. `bg_luma` and whether a stroke was needed)
-is under `pages[].robust_text`.
+signals to revisit knobs before sending. `doc_text:recolored:*` and
+`image_text:recolored:*` count words the OCR-driven #808080 rule recoloured;
+per-word detail (text, polarity, field luminance, OCR confidence) lives under
+`pages[].ocr_text.words` and `pages[].robust_text.words` respectively. Surface
+these word lists to the user so they can verify OCR didn't misread.

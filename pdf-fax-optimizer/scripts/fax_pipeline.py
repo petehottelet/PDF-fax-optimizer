@@ -5,7 +5,8 @@ Converts PDF pages to fax-native 1-bit (bilevel) output and packs them into a
 CCITT-G4 PDF (default) or a Class-F multipage TIFF. Implements the decisions
 described in references/fax-optimization.md:
 
-  - anisotropic rasterization at a fax-native resolution (clamped to 1728 px)
+  - square rasterization at the source's native resolution, hard-capped at
+    300 PPI (the 1-bit fax channel's legibility ceiling)
   - MRC-lite content segmentation (hard-threshold text, halftone photos),
     using the PDF's own embedded-image rectangles
   - background flatten / despeckle / deskew pre-cleans
@@ -29,18 +30,48 @@ import fitz  # PyMuPDF
 from PIL import Image
 import img2pdf
 
-# Fax-native resolutions: (horizontal_dpi, vertical_dpi)
+# Square (isotropic) detail presets — the halftone screen detail and the target for
+# vector-page rasterization. We render at the SOURCE'S NATIVE resolution where
+# possible, capped at `MAX_RENDER_DPI` (300 PPI — the legibility plateau for the
+# 1-bit fax channel). Vector PDFs rasterise at the preset DPI also clipped to the
+# ceiling; raster sources whose native DPI exceeds 300 PPI are bicubic-downsampled
+# to it. SUPERFINE is the default — its nominal 391 PPI lands at 300 PPI in
+# practice, finer than fax-superfine's 196×391 anisotropic grid on either axis,
+# and that's the most the channel can resolve.
 RESOLUTIONS = {
-    "standard": (204, 98),
-    "fine": (204, 196),
-    "superfine": (204, 391),
+    "standard": (98, 98),
+    "fine": (196, 196),
+    "superfine": (391, 391),
 }
-MAX_SCANLINE_PX = 1728
+DEFAULT_RESOLUTION = "superfine"
+
+# A real Group-3 fax line caps each scanline at 1728 px. Because we now render at
+# the SOURCE'S native (or the preset's) resolution, scanlines can be wider; pass
+# --transmission-safe to clamp back to 1728 for actual G3 transmission. The
+# pipeline-internal cap below is a different beast: it only stops a pathologically
+# low-DPI wrapped PDF (e.g. a 2320×3000 image declaring itself "32×41 inches at 72
+# DPI") from blowing up to a 200-megapixel buffer when SUPERFINE's 391-DPI floor
+# is applied. Pages above the cap simply render at a slightly lower square DPI.
+MAX_SCANLINE_PX = 24000
+# Hard ceiling on render DPI. 300 PPI is the legibility plateau for fax: a fine
+# fax preset is 196 lpi vertical, super-fine is 391 lpi vertical anisotropic, and
+# we run a SQUARE 300 PPI grid which exceeds both effective resolutions on the
+# scan-line axis while keeping page buffers small (8.5×11 → ~8 MP). Rendering
+# higher just makes the halftone CPU spend longer per pixel for no extra fidelity
+# the 1-bit channel can carry. Raster sources whose native DPI exceeds the cap
+# are bicubic-downsampled, which is fine — the binarizer copes with mild AA, and
+# the halftone screen at 300 PPI is finer than the source pixel grid anyway.
+MAX_RENDER_DPI = 300
+
+# The #808080 polarity rule: any text whose surrounding field is darker than this
+# is recolored WHITE; any text whose field is lighter is recolored BLACK. The fax
+# channel is luminance-only, so this is the bright-line rule for legibility.
+POLARITY_THRESHOLD = 128
 
 
 @dataclass
 class FaxOptions:
-    resolution: str = "fine"
+    resolution: str = DEFAULT_RESOLUTION
     dither: str = "auto"            # photo halftone schema (see HALFTONE_INFO)
     fax_heavy: bool = False
     segmentation: str = "embedded"  # embedded|variance|none
@@ -59,10 +90,12 @@ class FaxOptions:
     sharpen: bool = False           # edge-aware unsharp on photo regions
     green_noise_coarseness: float = 4.0  # green-noise AM<->FM knob (~2..8)
     text_in_image: bool = True      # rescue text baked into photos (don't halftone it)
-    robust_image_text: str = "auto"  # auto|on|off  recolor washout-prone colored text
-    robust_text_stroke: float = 0.15  # contrasting-stroke thickness (× glyph height), dark bg only
-    ocr_text: str = "off"            # off|auto|on  recognise baked-in text and re-typeset it
-    ocr_conf_min: float = 0.6        # minimum OCR confidence to re-typeset a word
+    robust_image_text: str = "off"   # off|on|auto  OCR-driven recolor of text inside images (opt-in)
+    robust_text_stroke: float = 0.15  # retained for back-compat; unused in the OCR/#808080 path
+    ocr_text: str = "auto"           # off|auto|on  OCR-driven polarity for ALL page text
+    ocr_conf_min: float = 0.5        # minimum OCR confidence to recolor a word
+    transmission_safe: bool = False  # clamp scanline to 1728 px for real G3 transmission
+    basic: bool = False              # bare-minimum pipeline: gray + Otsu, no MRC/OCR/cleanup
 
 
 @dataclass
@@ -83,29 +116,93 @@ class PageReport:
 # --------------------------------------------------------------------------- #
 # Rasterization                                                               #
 # --------------------------------------------------------------------------- #
+def _native_dpi(page: fitz.Page) -> float:
+    """Return the largest embedded image's effective DPI on the page (square),
+    or 0 for vector-only pages.
+
+    A raster source (PNG/JPG wrapped to PDF, scanned page) carries native pixels.
+    Rendering at less than its native DPI throws away detail, and the user has
+    asked us to ALWAYS keep that detail. Take the highest pixels-per-inch across
+    all embedded images so a single high-res image's grid is preserved."""
+    try:
+        imgs = page.get_images(full=True)
+    except Exception:
+        return 0.0
+    best = 0.0
+    for img in imgs:
+        xref = img[0]
+        try:
+            info = page.parent.extract_image(xref)
+            rects = page.get_image_rects(xref)
+        except Exception:
+            continue
+        wpx, hpx = info.get("width", 0), info.get("height", 0)
+        for r in rects:
+            iw, ih = r.width / 72.0, r.height / 72.0
+            if iw > 0 and wpx > 0:
+                best = max(best, wpx / iw)
+            if ih > 0 and hpx > 0:
+                best = max(best, hpx / ih)
+    return best
+
+
+def _effective_dpi(page: fitz.Page, preset_dpi: int) -> float:
+    """Square render DPI for the page, hard-capped at `MAX_RENDER_DPI` (300).
+
+    Vector pages (no embedded raster): use the preset DPI — text and line art
+    are real glyphs the renderer rasterises crisp at any DPI — clipped to the
+    ceiling. SUPERFINE's nominal 391 PPI lands at 300 PPI in practice; the
+    1-bit fax channel can't resolve the extra 91 PPI of line art anyway.
+
+    Raster pages: use NATIVE DPI, also clipped to the ceiling. Upscaling a
+    wrapped raster bicubic-interpolates everything in the source including the
+    text — thin strokes soften, the binarizer loses them, and "ABC" becomes
+    "A8C" — so we never render above native. (Halftone fineness at low native
+    DPI is recovered by picking an FM screen — `blue-noise` / `atkinson` —
+    whose dot pitch is the pixel itself, not a multi-pixel cell;
+    `choose_dither` does this automatically.) A 600-DPI scan downsamples to
+    300 PPI on the way in, which is what we want — fax legibility caps out
+    well below scanner-native resolution.
+
+    The DPI ceiling makes per-page buffers predictable: 8.5×11" → ~8 MP,
+    10×5.6" slide → ~5 MP, regardless of source resolution. Aspect ratio is
+    always preserved (DPI is square)."""
+    nat = _native_dpi(page)
+    if nat > 0:
+        return min(float(nat), float(MAX_RENDER_DPI))
+    return min(float(preset_dpi), float(MAX_RENDER_DPI))
+
+
+def _page_effective_dpi(page: fitz.Page, opt: "FaxOptions") -> int:
+    """The integer effective DPI for `page` under `opt`. Single source of truth
+    for both rendering AND halftone parameters: the screen cell size, blue-noise
+    tile, etc. all key off this value, so the halftone always matches the actual
+    pixel grid we rendered onto."""
+    preset = RESOLUTIONS[opt.resolution][0]
+    return int(round(_effective_dpi(page, preset)))
+
+
 def _page_scale(page_w_pt: float, hdpi: int, vdpi: int, max_w: int):
-    """Per-axis render scale (points→px). Anisotropic on purpose (fax pixels are
-    non-square: hdpi≠vdpi). If the page would exceed the scanline limit `max_w`,
-    scale BOTH axes by the same factor so the page keeps its aspect ratio —
-    clamping the horizontal scale alone leaves the page full-height and stretches
-    it vertically (a tall, squashed fax)."""
-    sx, sy = hdpi / 72.0, vdpi / 72.0
-    if page_w_pt * sx > max_w:
-        factor = max_w / (page_w_pt * sx)
-        sx *= factor
-        sy *= factor
-    return sx, sy
+    """Square render scale (points→px). The pipeline now runs at SQUARE pixels —
+    `hdpi` and `vdpi` are equal — so the rendered page keeps the source's aspect
+    ratio. If the rendered width would exceed `max_w` (only enabled in
+    transmission-safe mode), scale BOTH axes uniformly so the page stays
+    proportioned."""
+    s = max(hdpi, vdpi) / 72.0           # always square; tolerate legacy callers
+    if max_w > 0 and page_w_pt * s > max_w:
+        s = max_w / page_w_pt
+    return s, s
 
 
 def render_page_gray(page: fitz.Page, hdpi: int, vdpi: int,
                      max_w: int) -> np.ndarray:
-    """Render a page to a grayscale ndarray at anisotropic dpi.
+    """Render a page to a grayscale ndarray at the effective (square) DPI.
 
-    PyMuPDF's Matrix lets us scale x and y independently, so we render straight
-    onto the fax pixel grid instead of resampling a square render (which would
-    distort the page and risk moire).
-    """
-    sx, sy = _page_scale(page.rect.width, hdpi, vdpi, max_w)
+    Effective DPI = max(preset, native source DPI), so a high-resolution image is
+    preserved pixel-for-pixel and a vector page is rendered at the preset's square
+    detail. Pixels are square, so the page keeps its source aspect ratio."""
+    eff = _effective_dpi(page, max(hdpi, vdpi))
+    sx, sy = _page_scale(page.rect.width, int(round(eff)), int(round(eff)), max_w)
     mat = fitz.Matrix(sx, sy)
     pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY, alpha=False)
     arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
@@ -114,12 +211,10 @@ def render_page_gray(page: fitz.Page, hdpi: int, vdpi: int,
 
 def render_page_color(page: fitz.Page, hdpi: int, vdpi: int,
                       max_w: int) -> np.ndarray:
-    """Render a page to an RGB ndarray at the same grid as render_page_gray.
-
-    Used only for the comparison contact sheet's reference panel, so a viewer can
-    see the original color document next to its grayscale and halftoned versions.
-    """
-    sx, sy = _page_scale(page.rect.width, hdpi, vdpi, max_w)
+    """Render a page to an RGB ndarray on the same square grid as render_page_gray.
+    Used by OCR, robust-text, and the multi-panel sample sheet."""
+    eff = _effective_dpi(page, max(hdpi, vdpi))
+    sx, sy = _page_scale(page.rect.width, int(round(eff)), int(round(eff)), max_w)
     mat = fitz.Matrix(sx, sy)
     pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB, alpha=False)
     arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
@@ -164,26 +259,83 @@ def photo_region_mask(page: fitz.Page, shape, hdpi, vdpi, max_w,
 
 def variance_photo_mask(gray: np.ndarray, block: int = 24,
                         var_lo: float = 80.0, var_hi: float = 4000.0,
-                        min_area_frac: float = 0.015) -> np.ndarray:
-    """Heuristic photo mask for flattened scans.
+                        min_area_frac: float = 0.015,
+                        rgb: np.ndarray | None = None,
+                        chroma_seed: float = 2.0) -> np.ndarray:
+    """Heuristic photo mask for flattened scans (used when no embedded image
+    rectangles are available, or for the full-page wrapped-raster fallback).
 
-    Text/line-art blocks are bimodal (very high variance, sparse); flat
-    background is near-zero variance; continuous-tone photo blocks fall in a
-    mid band. We mark mid-variance blocks and clean up with morphology.
+    The trick on a wrapped form-and-photo page is that the photo has BOTH
+    colourful regions (sky, foliage, signage) and grayscale interiors (a
+    white car body, a dark grille). Earlier rules that gated on chroma OR on
+    `var > var_lo` per block excised those grayscale interiors and the
+    halftone became a swiss-cheese pattern — the SUV body and grille were
+    hard-thresholded into chunky black/white blobs while the surrounding
+    foliage and sky were halftoned smoothly. Filling the holes with
+    morphological close didn't work either, because a large interior gap
+    (the SUV, ~6% of the photo) was bigger than any kernel safely small
+    enough not to also bridge into the form table / message text sitting a
+    few pixels above/below the photo.
 
-    Text protection: gray / anti-aliased text often lands in the mid band, and a
-    naive CLOSE then welds those strokes into the photo blob — so the text gets
-    halftoned and becomes hard to read (exactly what we must avoid). We therefore
-    OPEN first (with a small kernel) to erase thin text strokes, CLOSE to
-    consolidate the genuine photo interior, then keep only large connected
-    components. Real photos are big contiguous regions; text-induced specks are
-    small and get dropped, so halftoning stays on image sections only.
+    The fix is to define the photo by the BOUNDING BOX of its colour-bearing
+    seed regions, not by the seed pixels themselves. Real photos have a
+    rectangular footprint; once we know that footprint, everything inside
+    halftones (including the grayscale SUV) and everything outside binarizes
+    (form table, body text, address). Steps:
+
+    1. Compute `chroma_box` — the mean chroma in each `block`-sized window.
+    2. Threshold at `chroma_seed` to find the photo's colour-bearing blocks.
+    3. Morph-close with a `block`-sized kernel so the sky and the building
+       and the billboard cluster into one seed blob, and keep components
+       above `min_area_frac` of the page so a small colour logo (a 60x60
+       gold flourish) doesn't sprout a halftone region of its own.
+    4. The photo region is the BBOX of each surviving seed component.
+
+    For grayscale sources (or pages whose colour content sits below the
+    `chroma.max() > 4.0` detect threshold), the chroma path self-disables
+    and we fall back to the historical mid-variance rule (a block is photo
+    if `var_lo < var < var_hi` — text is high-variance, paper is zero, the
+    middle band is photo) so a B/W scan still segments its photo regions.
+
+    `var_lo` is unused on the colour path but retained for API
+    compatibility and for the grayscale fallback.
     """
     h, w = gray.shape
     gf = gray.astype(np.float32)
     mean = cv2.boxFilter(gf, -1, (block, block))
     sq = cv2.boxFilter(gf * gf, -1, (block, block))
     var = np.clip(sq - mean * mean, 0, None)
+
+    use_chroma = False
+    chroma_box = None
+    if rgb is not None and rgb.ndim == 3:
+        rgbf = rgb.astype(np.float32)
+        r, g, b = rgbf[..., 0], rgbf[..., 1], rgbf[..., 2]
+        mc = (r + g + b) / 3.0
+        chroma = np.sqrt(((r - mc) ** 2 + (g - mc) ** 2 + (b - mc) ** 2) / 3.0)
+        if chroma.max() > 4.0:
+            chroma_box = cv2.boxFilter(chroma, -1, (block, block))
+            use_chroma = True
+
+    min_area = min_area_frac * h * w
+
+    if use_chroma:
+        seed = (chroma_box > chroma_seed).astype(np.uint8)
+        k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (block, block))
+        seed = cv2.morphologyEx(seed, cv2.MORPH_CLOSE, k_close)
+        n, _labels, stats, _cent = cv2.connectedComponentsWithStats(seed, 8)
+        out = np.zeros((h, w), dtype=np.uint8)
+        for i in range(1, n):
+            if stats[i, cv2.CC_STAT_AREA] < min_area:
+                continue
+            x0 = stats[i, cv2.CC_STAT_LEFT]
+            y0 = stats[i, cv2.CC_STAT_TOP]
+            ww = stats[i, cv2.CC_STAT_WIDTH]
+            hh = stats[i, cv2.CC_STAT_HEIGHT]
+            out[y0:y0 + hh, x0:x0 + ww] = 1
+        return out.astype(bool)
+
+    # Grayscale fallback: mid-variance band + morphology + min-area filter.
     band = ((var > var_lo) & (var < var_hi)).astype(np.uint8)
     k_open = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE, (max(3, block // 3), max(3, block // 3)))
@@ -192,44 +344,66 @@ def variance_photo_mask(gray: np.ndarray, block: int = 24,
     band = cv2.morphologyEx(band, cv2.MORPH_CLOSE, k_close)
     n, labels, stats, _ = cv2.connectedComponentsWithStats(band, 8)
     out = np.zeros_like(band)
-    min_area = min_area_frac * h * w
     for i in range(1, n):
         if stats[i, cv2.CC_STAT_AREA] >= min_area:
             out[labels == i] = 1
     return out.astype(bool)
 
 
-def _fill_holes(mask: np.ndarray) -> np.ndarray:
-    """Fill regions fully enclosed by `mask` (uint8 0/1). Flood the outer
-    background inward from a corner; any background pixels it can't reach are
-    interior holes, so OR them back into the mask. (For a full-page raster the
-    corners are document margin, i.e. background — the precondition for the one
-    caller, where the photo never reaches the page corners.)"""
-    inv = (1 - mask).astype(np.uint8)
-    ff = np.zeros((mask.shape[0] + 2, mask.shape[1] + 2), np.uint8)
-    cv2.floodFill(inv, ff, (0, 0), 0)
-    return mask | inv
+def _fill_component_holes(mask: np.ndarray) -> np.ndarray:
+    """Fill ONLY background holes that are bounded by a single connected
+    component of `mask` (uint8 0/1) — i.e. the sky/sign-patch case.
+
+    The earlier implementation flood-filled from corner (0,0) and OR'd back
+    every pixel it couldn't reach, which on a full-page wrapped raster fills
+    in the gap between scattered variance specks (form table rows, body
+    paragraph rows) and merges the whole page into one giant "photo" region.
+    That dragged the document's own text into the halftone path and
+    clobbered it.
+
+    Instead we walk component-by-component, take each component's bounding
+    box, and fill only the holes enclosed *within that bbox*. A form-table
+    row sitting between two real photo components will not be filled,
+    because no single component encloses it."""
+    m = mask.astype(np.uint8)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(m, 8)
+    out = m.copy()
+    for i in range(1, n):
+        x = stats[i, cv2.CC_STAT_LEFT]
+        y = stats[i, cv2.CC_STAT_TOP]
+        w = stats[i, cv2.CC_STAT_WIDTH]
+        h = stats[i, cv2.CC_STAT_HEIGHT]
+        # Pad by 1 px so the flood seed is guaranteed to be background.
+        sub = (labels[max(y - 1, 0):y + h + 1,
+                      max(x - 1, 0):x + w + 1] == i).astype(np.uint8)
+        inv = 1 - sub
+        ff = np.zeros((sub.shape[0] + 2, sub.shape[1] + 2), np.uint8)
+        cv2.floodFill(inv, ff, (0, 0), 0)
+        holes = inv.astype(bool)
+        out[max(y - 1, 0):y + h + 1, max(x - 1, 0):x + w + 1] |= holes
+    return out.astype(bool)
 
 
 def consolidate_photo_region(mask: np.ndarray, vdpi: int,
                              min_area_frac: float = 0.02) -> np.ndarray:
     """Turn a textured-photo mask into a solid photo *region*: close small gaps,
-    fill interior holes, and keep only large components.
+    fill interior holes within each photo component, and keep only large ones.
 
     This keeps flat areas that sit INSIDE a photo — a colored sign, a patch of sky
     — on the halftone path instead of binarizing them to stark white, while the
-    page's own text-on-white areas (which lie outside the photo) stay excluded."""
+    page's own text-on-white areas (which lie outside the photo) stay excluded.
+    Holes are filled per-component (see `_fill_component_holes`) so unrelated
+    text rows between photo specks don't accidentally merge into a halftone."""
     k = max(15, int(round(vdpi / 8)))
     m = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_CLOSE,
                          cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
-    m = _fill_holes(m)
     n, labels, stats, _ = cv2.connectedComponentsWithStats(m, 8)
     out = np.zeros_like(m)
     min_area = min_area_frac * mask.shape[0] * mask.shape[1]
     for i in range(1, n):
         if stats[i, cv2.CC_STAT_AREA] >= min_area:
             out[labels == i] = 1
-    return out.astype(bool)
+    return _fill_component_holes(out)
 
 
 # --------------------------------------------------------------------------- #
@@ -274,15 +448,34 @@ def deskew_gray(gray: np.ndarray, companions=None) -> tuple:
     return rot, float(angle), comp_out
 
 
-def despeckle_bw(bw: np.ndarray, min_area: int = 2) -> np.ndarray:
+def despeckle_bw(bw: np.ndarray, min_area: int = 2,
+                 protect: np.ndarray | None = None) -> np.ndarray:
     """Remove isolated black specks (connected black components <= min_area px).
-    bw: uint8 0/255 where 0 = black."""
+
+    bw: uint8 0/255 where 0 = black.
+    `protect`: optional boolean mask where True = "do not touch this pixel"
+        (typically the halftone region — a blue-noise dot is a 1-pixel
+        connected component and is exactly what despeckling would erase).
+
+    Vectorised: builds a per-component "is-tiny" lookup and applies it via a
+    single fancy-index over the label array, so the cost is O(n_pixels) +
+    O(n_components), not O(n_components × n_pixels). The old per-component
+    `out[lbl == i] = 255` Python loop scanned the entire label array for
+    every component — at 20 MP with millions of halftone dots that
+    multiplies to *trillions* of operations and the run effectively never
+    finishes."""
     black = (bw == 0).astype(np.uint8)
     n, lbl, stats, _ = cv2.connectedComponentsWithStats(black, connectivity=8)
+    if n <= 1:
+        return bw
+    areas = stats[:, cv2.CC_STAT_AREA]
+    tiny = areas <= min_area
+    tiny[0] = False                                 # label 0 is background
+    flip = tiny[lbl]                                # per-pixel boolean
+    if protect is not None:
+        flip &= ~protect
     out = bw.copy()
-    for i in range(1, n):
-        if stats[i, cv2.CC_STAT_AREA] <= min_area:
-            out[lbl == i] = 255
+    out[flip] = 255
     return out
 
 
@@ -425,321 +618,27 @@ def _text_line_filter(strokes: np.ndarray, vdpi: int, sw: int) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------- #
-# Robust image text — rescue colored / low-contrast text through the fax channel #
+# OCR-driven text recolor — the unified text path                              #
 # --------------------------------------------------------------------------- #
-# A grayscale fax pipeline silently loses text that differs from its background
-# mainly in HUE (e.g. yellow letters on a cyan field): both map to similar
-# luminance, so after desaturation the glyphs vanish or merge, and a 1-bit
-# threshold finishes the job. The signal that separates such text from its
-# background lives in CHROMA — which grayscale throws away. This pass runs on the
-# COLOR render, finds text whose chroma contrast is high but luminance contrast
-# is low, segments the glyph pixels in LAB, and rewrites them into the gray
-# buffer as solid black on a white matte. Everything downstream then inherits
-# trivially legible, high-contrast text and needs no changes. It is deliberately
-# conservative (same text-line geometry gate as text_in_image_mask) so ordinary
-# black-on-white text — already high luminance contrast — is left untouched.
-
-def _lab(rgb: np.ndarray):
-    """Return (L, a, b) float planes; a/b centered on 0 (OpenCV stores +128)."""
-    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
-    return (lab[:, :, 0].astype(np.float32),
-            lab[:, :, 1].astype(np.float32) - 128.0,
-            lab[:, :, 2].astype(np.float32) - 128.0)
-
-
-def washout_text_mask(rgb: np.ndarray, vdpi: int,
-                      aggressive: bool = False) -> np.ndarray:
-    """Boolean mask of text whose ink/background differ strongly in COLOR but only
-    weakly in LUMINANCE — the case a grayscale pipeline cannot see.
-
-    For each candidate stroke we require a strong *chroma* top-hat/black-hat
-    response AND a weak *luminance* one (high luma contrast means ordinary text
-    the existing path already handles — skip it), then pass the result through the
-    shared text-line geometry gate so only rows of glyphs survive."""
-    L, a, b = _lab(rgb)
-    L8 = np.clip(L, 0, 255).astype(np.uint8)
-    a8 = np.clip(a + 128.0, 0, 255).astype(np.uint8)
-    b8 = np.clip(b + 128.0, 0, 255).astype(np.uint8)
-    # Multi-scale top-hat/black-hat: body text has ~2px strokes, but signage and
-    # display type (the washout case) has thick strokes a small kernel only sees
-    # the edges of. Take the max response across a few stroke widths so both thin
-    # and bold colored text register.
-    base = max(2, int(round(vdpi / 90)))
-    scales = sorted({base, base * 2, base * 4})
-
-    def hat(plane8, sw):
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * sw + 1, 2 * sw + 1))
-        return np.maximum(cv2.morphologyEx(plane8, cv2.MORPH_BLACKHAT, k),
-                          cv2.morphologyEx(plane8, cv2.MORPH_TOPHAT, k))
-
-    chroma_resp = np.zeros(L.shape, np.float32)
-    luma_resp = np.full(L.shape, 255.0, np.float32)   # min luma contrast across scales
-    for sw in scales:
-        chroma_resp = np.maximum(chroma_resp,
-                                 np.maximum(hat(a8, sw), hat(b8, sw)).astype(np.float32))
-        luma_resp = np.minimum(luma_resp, hat(L8, sw).astype(np.float32))
-    chroma_thr = 12.0 if aggressive else 16.0      # min hue contrast to qualify
-    luma_weak = 60.0 if aggressive else 50.0       # luma contrast above this = ordinary text, skip
-    strokes = ((chroma_resp >= chroma_thr) &
-               (luma_resp <= luma_weak)).astype(np.uint8)
-    return _text_line_filter(strokes, vdpi, base)
-
-
-def _segment_ink(rgb_bbox: np.ndarray, stroke_bbox: np.ndarray):
-    """Within one (generously padded) text region, split pixels into ink vs
-    background by k=2 LAB clustering and return a boolean ink mask.
-
-    The ink cluster is the **minority** one: on a sign or label the glyphs always
-    cover less area than the field they sit on, and this holds whether the text is
-    darker OR lighter than the field, and whether the *text* or the *background* is
-    the saturated colour. (A stroke-concentration vote fails for light text on a
-    coloured field — e.g. cream letters on gold — because the chroma response lands
-    on the field side of the edge, not the near-neutral letters.) When the two
-    clusters are close in size the result is ambiguous, so fall back to the
-    stroke-overlap vote as a tiebreaker. Clustering captures anti-aliased glyph
-    edges a luminance threshold would drop."""
-    L, a, b = _lab(rgb_bbox)
-    feats = np.stack([L.ravel() * 0.6, a.ravel(), b.ravel()], axis=1).astype(np.float32)
-    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
-    try:
-        _, labels, _ = cv2.kmeans(feats, 2, None, crit, 3, cv2.KMEANS_PP_CENTERS)
-    except cv2.error:
-        return None
-    labels = labels.reshape(L.shape)
-    s = stroke_bbox.astype(bool)
-    if not s.any():
-        return None
-    counts = [int((labels == 0).sum()), int((labels == 1).sum())]
-    if max(counts) >= 1.5 * max(1, min(counts)):
-        ink_label = int(np.argmin(counts))            # minority cluster = the glyphs
-    else:                                             # sizes too close → tiebreak
-        score = [(s & (labels == c)).sum() / max(1, counts[c]) for c in (0, 1)]
-        ink_label = int(np.argmax(score))
-    return labels == ink_label
-
+# The fax channel is luminance-only, so the contract for legible text is brutally
+# simple: for every word on the page, paint its glyphs SOLID BLACK on a light/mid
+# field or SOLID WHITE on a dark field — the #808080 polarity rule. We use OCR
+# (rapidocr-onnxruntime) as a robust *word locator* (not as a typesetter): it
+# finds where the words are, then we segment each word's ORIGINAL glyph pixels
+# from the colour image and recolor *those exact pixels* per the rule, so the
+# real letterforms are preserved (never retyped). The recoloured glyphs ride a
+# text *layer* that sits ABOVE the halftoned image layer in the final composite,
+# so the halftone screen can never disturb them.
+#
+# The same function handles both scopes: text OUTSIDE images (the document's
+# header/footer/form text) and, when --robust-text is on, text INSIDE images
+# (signage, captions). The only difference between the two calls is the region
+# mask the OCR is scoped to.
 
 def _ellipse(r: int):
     return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
 
 
-# Target luminance the local field around rescued glyphs is lifted to, so it screens
-# to only sparse dots (≈8% at L=224) and black text keeps clean breathing room. WCAG
-# contrast on a *uniform* fill is met far darker than this (black on L=145 is already
-# 6.7:1), but a halftone is NOT uniform — its dots are the same ink as the glyphs —
-# so the binding constraint is dot density, which is why the field must be lifted
-# this light even though its nominal contrast was already "compliant".
-ROBUST_FIELD_LUMA = 224
-# ...but lift the field ONLY when it would otherwise screen too dense for black text.
-# A field already light enough (a cyan sign ~163 → ~24% dots) carries solid black on
-# its natural halftone and is left untouched — lifting it would just paint an ugly
-# bright halo. Only a denser field (a gold sign ~145 → ~30% dots) is lifted.
-ROBUST_MAX_FIELD_DARKNESS = 0.27
-# Above this predicted darkness the field is too dark for any solid-black treatment
-# to read, and — because genuine light-on-dark text keeps high luminance contrast and
-# so is never detected here — such detections are almost always photo-chroma noise.
-# Reject them rather than lighten a patch of the photo.
-ROBUST_REJECT_DARKNESS = 0.45
-
-
-def _halftone_darkness(luma: float, gamma: float = 0.64) -> float:
-    """Predicted black-dot fraction of a flat tone after the screen — the tone
-    curve lightens mid-tones to fight dot gain, then the screen lays dots ∝ how
-    dark it still is. Used to reject fields too dark to carry text."""
-    return 1.0 - (max(0.0, luma) / 255.0) ** gamma
-
-
-def apply_robust_image_text(rgb: np.ndarray, vdpi: int,
-                            mode: str, text_binarize: str, stroke: float = 0.15,
-                            skip_mask: np.ndarray = None):
-    """Identify washout-prone / baked-in image text on the COLOUR render and recolor
-    it SOLID BLACK or SOLID WHITE *in colour, before the grayscale conversion*, then
-    leave the rest of the image to halftone normally. Four steps that mirror a
-    contrast-accessibility check: (1) **identify the text** on the colour image as
-    the union of a chroma detector (light/low-luminance coloured text — e.g. cream
-    "VILLA" on teal) and a luminance detector (darker text — e.g. "SOL"), because on
-    a glossy sign one word reads by colour and the next by brightness; (2) **identify
-    its field** (the local background tone around the glyphs); (3) **fix the
-    contrast** — pick a polarity from the field luminance and paint the glyphs into
-    the colour buffer: SOLID BLACK on a light/mid field (lifting a too-dense mid
-    field light so it screens sparse) or SOLID WHITE on a genuinely dark field
-    (knockout, over a uniformly darkened field); (4) leave the rest to **halftone
-    normally**. Returns (rgb_out, keep_mask, info) — the caller derives grayscale
-    from rgb_out, so the recolour provably precedes the grayscale conversion.
-
-    Two field treatments back the black path's lift and the white path's knockout. A
-    halftone of a mid-tone field is a dense field of black dots — the *same ink* as
-    black glyphs — so even though the field's nominal WCAG contrast is fine, the
-    screen crowds the strokes; lifting the local field light enough to screen sparse
-    restores breathing room while keeping it on the halftone path (a light,
-    lightly-textured sign, not a stark white plate). A genuinely dark field can't be
-    lifted without punching a bright hole in the photo, so there the polarity flips
-    to white-on-dark knockout over a uniformly darkened field instead. Text already
-    on a near-white field is skipped (the binarizer renders document text crisp).
-
-    A region is committed only if its segmentation looks like text (ink coverage in
-    a sane band) and the result verifies as legible in the actual 1-bit output;
-    regions that fail are reverted. (`stroke` is retained for call compatibility
-    and currently unused.)"""
-    h0, w0 = rgb.shape[:2]
-    info = {"mode": mode, "regions_detected": 0, "regions_recovered": 0,
-            "regions_unrecovered": 0, "regions_rejected": 0, "details": []}
-    if mode == "off":
-        return rgb, np.zeros((h0, w0), bool), info
-
-    # Luminance of the COLOUR render — used for the luminance text detector and for
-    # measuring each region's field tone. The chroma detector reads `rgb` directly.
-    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-    # Candidate text = the union of the CHROMA detector (light/low-luminance
-    # coloured text — e.g. cream "VILLA" on teal) and the LUMINANCE detector
-    # (darker baked-in text — e.g. "SOL", "PRESTIGE ESTATES"). The two are
-    # complementary: on a glossy sign one word can read by colour and the next by
-    # brightness, so neither alone covers the whole line.
-    wmask = (washout_text_mask(rgb, vdpi, aggressive=(mode == "on"))
-             | text_in_image_mask(gray, vdpi))
-    if skip_mask is not None and skip_mask.any():
-        # Text already recovered by OCR (re-typeset crisply) — don't re-detect and
-        # re-process it here. Dilate a little so glyph fringes are excluded too.
-        wmask &= ~cv2.dilate(skip_mask.astype(np.uint8),
-                             _ellipse(max(2, vdpi // 40))).astype(bool)
-    keep = np.zeros((h0, w0), bool)
-    if not wmask.any():
-        return rgb, keep, info
-
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(
-        wmask.astype(np.uint8), 8)
-
-    def _ink_frac(buf, sel=None):
-        bw = binarize_text(buf, text_binarize, vdpi)
-        s = bw if sel is None else bw[sel]
-        return float((s == 0).mean()) if s.size else 0.0
-
-    # Pass 1: validate each candidate and decide its polarity + field treatment.
-    H, W = gray.shape
-    # (x0,y0,x1,y1, ink, label_r, polarity, field_op, vmarg, cover, before, bg_luma)
-    #   polarity: 'black' | 'white'   field_op: 'none' | 'lift' | 'darken'
-    candidates = []
-    for i in range(1, n):
-        x, y, w, h, _ = stats[i]
-        # Pad generously (≈ half the line height) so the crop contains real
-        # background around the glyphs — k=2 clustering needs both classes present
-        # to separate letters from their field rather than letter-edge from body.
-        pad = max(int(vdpi / 60), h // 2)
-        y0, y1 = max(0, y - pad), min(H, y + h + pad)
-        x0, x1 = max(0, x - pad), min(W, x + w + pad)
-        comp = (labels[y0:y1, x0:x1] == i)
-        ink = _segment_ink(rgb[y0:y1, x0:x1], comp)
-        if ink is None:
-            continue
-        # Reject regions whose segmentation isn't text-like: real glyph rows cover
-        # a modest fraction of their plate. Too little = noise; too much = a solid
-        # color patch, not letters. This filters photo false positives.
-        cover = float(ink.mean())
-        if not (0.04 <= cover <= 0.55):
-            info["regions_rejected"] += 1
-            continue
-        gcrop = gray[y0:y1, x0:x1]
-        ink_u8 = ink.astype(np.uint8)
-        # Background tone right around the glyphs (excluding the glyphs).
-        near = cv2.dilate(ink_u8, _ellipse(max(3, h // 2))).astype(bool) & ~ink
-        bg_vals = gcrop[near] if near.any() else gcrop[~ink]
-        bg_luma = float(np.median(bg_vals)) if bg_vals.size else 255.0
-        if bg_luma >= 228:
-            # Text already on a (near-)white field: the binarizer renders it crisp
-            # black-on-white on its own and won't halftone it. Robust-text adds
-            # nothing here (this is ordinary document text), so skip it.
-            continue
-        darkness = _halftone_darkness(bg_luma)
-        if darkness > ROBUST_REJECT_DARKNESS:
-            # Genuinely dark field. The signal (chroma/luminance) detectors cannot
-            # tell dark-SIGN text from dark-PHOTO noise (car windows, shadows): both
-            # span the same luma/texture range, so flipping these to white knockout
-            # paints black slabs over the photo. White-on-dark recovery is therefore
-            # left to the OCR path, where actual word recognition gates it. Reject
-            # here rather than punch a hole in the photo.
-            info["regions_rejected"] += 1
-            continue
-        # Radius of the lifted field carried around the glyphs, scaled to glyph
-        # height so every letter gets clean breathing room.
-        label_r = max(3, int(round(h * 0.45)), int(round(vdpi * 0.02)))
-        # Verify over the glyphs plus a generous margin so dense/bold text isn't
-        # mis-scored as "too much ink" (a tight zone over-counts the strokes).
-        vmarg = cv2.dilate(ink_u8, _ellipse(max(3, int(round(h * 0.6))))).astype(bool)
-        before = _ink_frac(gcrop, vmarg)
-        # Solid black glyphs; lift the field light ONLY if it would otherwise screen
-        # too dense for black text (a mid-dense field), so the screen can't crowd
-        # the strokes. (White-on-dark knockout lives on the OCR path; see above.)
-        field_op = "lift" if darkness > ROBUST_MAX_FIELD_DARKNESS else "none"
-        candidates.append((x0, y0, x1, y1, ink, label_r, "black", field_op,
-                           vmarg, cover, before, bg_luma))
-
-    if not candidates:
-        return rgb, keep, info
-
-    def _composite(selected):
-        """Paint each region into a copy of the COLOUR image: glyphs to solid black
-        or solid white, and the local field lifted light (so a mid-dense field
-        screens to sparse dots and black text keeps breathing room) or darkened (so
-        white knockout reads). Returns (rgb_out, keep_mask). keep_mask = glyphs
-        (always) + any darkened field, so the halftone step skips them; a *lifted*
-        field stays on the halftone path and reads as a light, textured sign."""
-        black_ink = np.zeros((H, W), bool)
-        white_ink = np.zeros((H, W), bool)
-        light_field = np.zeros((H, W), bool)
-        dark_field = np.zeros((H, W), bool)
-        for x0, y0, x1, y1, ink, label_r, polarity, field_op, *_ in selected:
-            sub = np.zeros((H, W), bool)
-            sub[y0:y1, x0:x1] = ink
-            (white_ink if polarity == "white" else black_ink)[sub] = True
-            if field_op in ("lift", "darken"):
-                field = (cv2.dilate(sub.astype(np.uint8),
-                                    _ellipse(label_r)).astype(bool) & ~sub)
-                (light_field if field_op == "lift" else dark_field)[field] = True
-        glyphs = black_ink | white_ink
-        light_field &= ~glyphs
-        dark_field &= ~glyphs & ~light_field
-        o = rgb.copy()
-        o[light_field] = np.maximum(o[light_field], ROBUST_FIELD_LUMA)  # lift mid field
-        o[dark_field] = np.minimum(o[dark_field], 28)                   # darken for knockout
-        o[black_ink] = 0                                                # solid-black glyphs
-        o[white_ink] = 255                                              # solid-white knockout
-        return o, glyphs | dark_field   # glyphs + solid dark field skip the halftone
-
-    # Composite, verify with the actual 1-bit result, and revert any region whose
-    # glyphs don't come out legible (so the self-check gates the change).
-    out, keep = _composite(candidates)
-    passed, results = [], []
-    for cand in candidates:
-        x0, y0, x1, y1, ink, label_r, polarity, field_op, vmarg, cover, before, bg_luma = cand
-        after = _ink_frac(cv2.cvtColor(out[y0:y1, x0:x1], cv2.COLOR_RGB2GRAY), vmarg)
-        # Committed regions are legible by construction. The ink check binarizes the
-        # surround, so it over-counts; use it only as a gross-failure guard:
-        #  - black: revert if the region collapsed to a near-solid black slab.
-        #  - white: revert only if nothing white survived (region went fully black).
-        legible = (after <= 0.9) if polarity == "black" else (after <= 0.985)
-        if legible:
-            passed.append(cand)
-        results.append((x0, y0, x1, y1, cover, before, after, bg_luma, polarity, legible))
-
-    if len(passed) != len(candidates):
-        out, keep = _composite(passed)        # recomposite without the failed ones
-
-    for x0, y0, x1, y1, cover, before, after, bg_luma, polarity, legible in results:
-        if legible:
-            info["regions_recovered"] += 1
-        else:
-            info["regions_unrecovered"] += 1   # detected but reverted (left untouched)
-        info["details"].append({
-            "bbox": [int(x0), int(y0), int(x1), int(y1)],
-            "ink_before": round(before, 3), "ink_after": round(after, 3),
-            "cover": round(cover, 3), "bg_luma": round(bg_luma, 1),
-            "polarity": polarity, "legible": bool(legible)})
-    info["regions_detected"] = len(results)
-    return out, keep, info
-
-
-# --------------------------------------------------------------------------- #
-# OCR text recovery — recognise baked-in text, recolor its ORIGINAL glyphs      #
-# --------------------------------------------------------------------------- #
 def _rel_luminance(rgb):
     """WCAG relative luminance of an sRGB colour (array last-axis = RGB, 0–255)."""
     c = np.asarray(rgb, np.float64) / 255.0
@@ -755,19 +654,33 @@ def _wcag_contrast(rgb1, rgb2) -> float:
 
 
 def _segment_word(rgb: np.ndarray, gray: np.ndarray, quad: np.ndarray):
-    """Use the OCR box only to LOCATE a word, then segment its ORIGINAL glyph
-    pixels (preserving the real letterforms). Returns (ink_full, bbox, field_gray,
-    field_rgb, contrast) or None — *no* recoloring, so the caller can apply ONE
-    consistent treatment across all the words on a sign.
+    """Use the OCR quad only to LOCATE a word, then segment its ORIGINAL glyph
+    pixels (preserving the real letterforms). Returns (ink_full, bbox,
+    field_gray, contrast) or None — *no* recoloring, so the caller can apply
+    ONE consistent treatment across all the words on a sign.
 
-    The OCR box's PADDING is, by construction, field: take the field colour from
-    that border ring and call any pixel inside the box that differs from it (in full
-    LAB) a glyph. This is robust to the glyph/field area ratio, unlike a 2-means
-    split which can invert on a tight box."""
+    Strategy:
+    1. **Tight field sampling.** Field colour comes from a thin ring *just
+       outside* the OCR quad (a few percent of glyph height), so on small
+       signs the ring still falls on the sign plate — never the surrounding
+       photo, which would corrupt the field estimate and turn the segmenter
+       into a blob detector.
+    2. **Hysteresis threshold on LAB distance.** Otsu finds the natural valley
+       between field and glyph clusters → a HIGH threshold marks "definite
+       glyph" seeds (no AA halos, no shadows). A LOW threshold marks
+       "candidate glyph" pixels including AA. The final ink mask is the
+       connected components of the candidate set that touch a definite-glyph
+       seed. Pixels at ambiguous distance only survive if they are part of a
+       larger glyph stroke (region-growing), which preserves letterforms
+       without inflating them.
+    3. **Minimal cleanup.** A 1-pixel open removes specks; no close (a close
+       welds adjacent letters together and fattens strokes — the very thing
+       the user complained about)."""
     H, W = gray.shape
     q = np.asarray(quad, np.float32)
     bh = max(q[:, 1].max() - q[:, 1].min(), 1.0)
-    pad = max(4, int(bh * 0.4))
+    pad = max(4, int(bh * 0.25))
+    ring_w = max(2, int(round(bh * 0.15)))
     y0 = max(0, int(q[:, 1].min()) - pad); y1 = min(H, int(q[:, 1].max()) + pad)
     x0 = max(0, int(q[:, 0].min()) - pad); x1 = min(W, int(q[:, 0].max()) + pad)
     if y1 - y0 < 6 or x1 - x0 < 10:
@@ -776,23 +689,60 @@ def _segment_word(rgb: np.ndarray, gray: np.ndarray, quad: np.ndarray):
     cgray = gray[y0:y1, x0:x1]
     hc, wc = cgray.shape
     lab = cv2.cvtColor(crgb, cv2.COLOR_RGB2LAB).astype(np.float32)
-    b = max(2, pad // 2)
-    ring = np.zeros((hc, wc), bool)
-    ring[:b, :] = ring[-b:, :] = ring[:, :b] = ring[:, -b:] = True
-    field_lab = np.median(lab[ring].reshape(-1, 3), axis=0)
-    dist = np.linalg.norm(lab - field_lab, axis=2)
     box = np.zeros((hc, wc), np.uint8)
     cv2.fillConvexPoly(box, (q - [x0, y0]).astype(np.int32), 1)
     box = box.astype(bool)
-    inbox = dist[box]
-    if inbox.size == 0:
+    if not box.any():
         return None
-    thr = max(9.0, float(np.percentile(inbox, 60)))   # glyphs are the high-distance tail
-    ink = (dist > thr) & box
-    ink = cv2.morphologyEx(ink.astype(np.uint8), cv2.MORPH_OPEN,
-                           _ellipse(1)).astype(bool)
-    cover = float(ink[box].mean()) if box.any() else 0.0
-    if ink.sum() < 12 or not (0.03 <= cover <= 0.7):
+    quad_dilated = cv2.dilate(box.astype(np.uint8), _ellipse(ring_w))
+    ring = quad_dilated.astype(bool) & ~box
+    if not ring.any():
+        ring = ~box
+    field_lab = np.median(lab[ring].reshape(-1, 3), axis=0)
+    dist = np.linalg.norm(lab - field_lab, axis=2)
+    inbox = dist[box]
+    if inbox.size < 16:
+        return None
+
+    # Otsu on the in-quad distance distribution: natural valley between field
+    # cluster (low distance) and glyph cluster (high distance), regardless of
+    # the glyph/field area ratio. The +6 floor guarantees we're a real distance
+    # away from the field colour even on near-uniform crops where Otsu might
+    # pick a tiny threshold and turn quantisation noise into ink.
+    distu8 = np.clip(inbox, 0, 255).astype(np.uint8)
+    otsu_thr, _ = cv2.threshold(distu8, 0, 255,
+                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    thr_high = max(float(otsu_thr), 6.0)
+    thr_low = max(thr_high * 0.55, 4.0)
+
+    seed = (dist >= thr_high) & box
+    cand = (dist >= thr_low) & box
+    if not seed.any():
+        return None
+
+    # Hysteresis: keep only the connected components of `cand` that touch a
+    # `seed` pixel. AA halos and shadow specks have low-distance noise but
+    # no seed inside them, so they get dropped — letter strokes always have
+    # a high-distance core, so they survive end-to-end.
+    n_cc, labels = cv2.connectedComponents(cand.astype(np.uint8), 8)
+    if n_cc <= 1:
+        return None
+    seed_labels = np.unique(labels[seed])
+    seed_labels = seed_labels[seed_labels != 0]
+    if seed_labels.size == 0:
+        return None
+    keep = np.zeros(n_cc, dtype=bool)
+    keep[seed_labels] = True
+    ink = keep[labels] & box
+
+    # Drop isolated single-pixel specks the connected-component pass left in.
+    if bh >= 12:
+        ink = cv2.morphologyEx(
+            ink.astype(np.uint8), cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))).astype(bool)
+
+    cover = float(ink[box].mean())
+    if ink.sum() < 12 or not (0.02 <= cover <= 0.55):
         return None
     field_gray = float(np.median(cgray[ring]))
     field_rgb = crgb[ring].reshape(-1, 3).mean(0)
@@ -802,115 +752,158 @@ def _segment_word(rgb: np.ndarray, gray: np.ndarray, quad: np.ndarray):
     return ink_full, (x0, y0, x1, y1), field_gray, round(contrast, 2)
 
 
-def apply_ocr_text(rgb: np.ndarray, vdpi: int,
-                   region_mask: np.ndarray, conf_min: float = 0.5):
-    """Recognise text inside `region_mask` (the photo/image area) and recolor each
-    word's ORIGINAL glyph pixels for contrast — recovering text the signal path
-    can't (a sign word in a specular highlight has near-zero contrast in grayscale,
-    but still reads to a recogniser on the colour image, and its glyphs are still
-    separable *by colour*, so the real letterforms can be recoloured, not retyped).
+def apply_ocr_polarity(rgb: np.ndarray, region_mask: np.ndarray | None,
+                       conf_min: float = 0.5, scope: str = "image"):
+    """Run OCR over `region_mask`, segment each word's ORIGINAL glyph pixels, and
+    decide per-word polarity by the #808080 rule (median field luma < 128 → WHITE
+    glyphs; ≥ 128 → BLACK glyphs). Used by BOTH text-handling passes:
 
-    The recolor is decided **per sign, not per word**: words are grouped into signs
-    by proximity, the field tone is taken once across the whole group, and ALL its
-    glyphs get the same polarity (solid black on a light/mid field, solid white on a
-    dark one) and the same field treatment (one uniform lift if the field would
-    screen too dense — never a separate blob per line). Identification and recolor
-    happen on the COLOUR image, before the grayscale conversion.
+    - scope="doc":   region_mask = pixels OUTSIDE images. This catches the page's
+                     header/footer/form text, including white-on-coloured headers
+                     a global Otsu threshold or naive binarizer can flip.
+    - scope="image": region_mask = pixels INSIDE photo regions (robust-text). This
+                     catches signage and captions baked into the photo.
 
-    Scoped to image regions (never crisp vector document text) and to coloured
-    fields (not text on white). Returns (rgb_out, fixed_mask, word_region, info);
-    `info['words']` lists each string with its confidence and measured WCAG
-    contrast, so the result can be verified (OCR can misread)."""
+    Returns (text_black, text_white, halftone_exclude, info). The two text
+    masks are composited OVER the binarized + halftoned page; the
+    `halftone_exclude` mask covers the *bbox area* of any word whose field is
+    near-white (bg_luma ≥ 200), so the field around clean document text reads
+    as a flat white plate instead of being halftoned (this is what saves doc
+    text that the photo segmenter pulled into the image region by mistake).
+    Words on a coloured field — signage at bg_luma ~140 — are left on the
+    halftone path so the sign keeps its textured colour around the recoloured
+    letters.
+
+    OCR is optional: if `rapidocr-onnxruntime` isn't installed, the function
+    returns empty masks and the rest of the pipeline still works (the binarizer
+    handles plain document text on its own; only the OCR-driven robust path goes
+    quiet). The polarity is decided **per sign** (words grouped by proximity)
+    so all glyphs on one sign carry the same treatment."""
     import ocr_text
-    info = {"engine": ocr_text.engine_name(), "words": []}
-    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)     # luminance of the COLOUR render
-    fixed = np.zeros(gray.shape, bool)
-    region = np.zeros(gray.shape, np.uint8)          # whole word areas (for robust skip)
-    if region_mask is None or not region_mask.any():
-        return rgb, fixed, region.astype(bool), info
-    ys, xs = np.where(region_mask)
-    y0, y1, x0, x1 = int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1
-    crop = rgb[y0:y1, x0:x1]
-    # Upscale for OCR: a fax-DPI render makes signage text small, and the recogniser
-    # drops word spaces at small sizes; 1.5–2× restores cleaner boxes.
-    hc, wc = crop.shape[:2]
-    scale = max(1.0, min(2.0, 2600.0 / max(hc, wc, 1)))
-    if scale > 1.01:
-        crop = cv2.resize(crop, None, fx=scale, fy=scale,
-                          interpolation=cv2.INTER_CUBIC)
-    words = ocr_text.recognize(crop, conf_min)
+    H, W = rgb.shape[:2]
+    info = {"scope": scope, "engine": ocr_text.engine_name(),
+            "words_recognized": 0, "words_recolored_black": 0,
+            "words_recolored_white": 0, "words": []}
+    text_black = np.zeros((H, W), bool)
+    text_white = np.zeros((H, W), bool)
+    halftone_exclude = np.zeros((H, W), bool)
+    if region_mask is None or not np.any(region_mask):
+        return text_black, text_white, halftone_exclude, info
 
-    # Pass 1: validate + segment each word (no recolor yet).
-    cands = []   # (text, conf, ink_full, bbox, field_gray)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+
+    ys, xs = np.where(region_mask)
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    crop = rgb[y0:y1, x0:x1]
+    # Resample the crop to ~2600 px on its long edge before OCR. This is two
+    # things at once: tiny crops are UPSCALED so the recogniser sees clean
+    # text (rapidocr drops word spacing at small sizes); oversized crops from
+    # high-DPI rasterization are DOWNSCALED so OCR's CPU cost stays bounded
+    # (running detection on a 4000-px page is ~10× slower than on 2600 with
+    # no measurable accuracy gain). Word quads come back at the resampled
+    # scale and are mapped to full-resolution coordinates below, so glyph
+    # segmentation still happens on the original pixels.
+    hc, wc = crop.shape[:2]
+    scale = max(0.5, min(2.0, 2600.0 / max(hc, wc, 1)))
+    if abs(scale - 1.0) > 0.01:
+        interp = cv2.INTER_CUBIC if scale > 1.0 else cv2.INTER_AREA
+        crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=interp)
+    words = ocr_text.recognize(crop, conf_min)
+    info["words_recognized"] = len(words)
+    if not words:
+        return text_black, text_white, halftone_exclude, info
+
+    # Pass 1: keep only words whose centre falls inside the region, and segment
+    # each word's ORIGINAL glyph pixels. No recolour yet.
+    cands = []   # (text, conf, ink_full, bbox, field_gray, contrast)
     for text, quad, conf in words:
-        quad = quad / scale + np.array([x0, y0], np.float32)   # → full-image coords
-        iy, ix = int(round(quad[:, 1].mean())), int(round(quad[:, 0].mean()))
-        if not (0 <= iy < gray.shape[0] and 0 <= ix < gray.shape[1]):
-            continue
-        if not region_mask[iy, ix]:                  # centre must be in a photo
-            continue
-        # Only touch text on a COLOURED/photo field — crisp document text on a
-        # near-white field is already rendered perfectly by the binarizer.
-        qb = quad.astype(int)
-        p = gray[max(0, qb[:, 1].min()):qb[:, 1].max() + 1,
-                 max(0, qb[:, 0].min()):qb[:, 0].max() + 1]
-        if p.size and float(np.median(p)) >= 222:
+        quad = quad / scale + np.array([x0, y0], np.float32)
+        iy = int(round(quad[:, 1].mean()))
+        ix = int(round(quad[:, 0].mean()))
+        if not (0 <= iy < H and 0 <= ix < W) or not region_mask[iy, ix]:
             continue
         seg = _segment_word(rgb, gray, quad)
         if seg is None:
             continue
         ink_full, bbox, field_gray, contrast = seg
-        cands.append((text, conf, contrast, ink_full, bbox, field_gray))
+        cands.append((text, conf, ink_full, bbox, field_gray, contrast))
 
     if not cands:
-        return rgb, fixed, region.astype(bool), info
+        return text_black, text_white, halftone_exclude, info
 
-    # Group words into signs by proximity (so the same background gets one
-    # treatment). Dilate the word boxes by ~a line height and connect them.
-    H, W = gray.shape
-    bhs = [c[4][3] - c[4][1] for c in cands]
+    # Group words into signs by proximity so co-located text gets one consistent
+    # treatment (avoids painting "VILLA" black and "DEL" white on the same plate).
+    bhs = [c[3][3] - c[3][1] for c in cands]
     link = max(8, int(np.median(bhs) * 0.9))
     gm = np.zeros((H, W), np.uint8)
-    for *_x, bbox, _f in cands:
-        bx0, by0, bx1, by1 = bbox
+    for c in cands:
+        bx0, by0, bx1, by1 = c[3]
         gm[by0:by1, bx0:bx1] = 1
     gm = cv2.dilate(gm, _ellipse(link))
-    n, lbl = cv2.connectedComponents(gm, 8)
-    groups = {}
+    _n, lbl = cv2.connectedComponents(gm, 8)
+    groups: dict = {}
     for c in cands:
-        bx0, by0, bx1, by1 = c[4]
-        groups.setdefault(int(lbl[(by0 + by1) // 2, (bx0 + bx1) // 2]), []).append(c)
+        bx0, by0, bx1, by1 = c[3]
+        gid = int(lbl[(by0 + by1) // 2, (bx0 + bx1) // 2])
+        groups.setdefault(gid, []).append(c)
 
-    out = rgb.copy()       # recolor IN COLOUR; caller derives grayscale afterwards
     for grp in groups.values():
-        sign_field = float(np.median([c[5] for c in grp]))   # one field tone per sign
-        black = sign_field >= 110                            # light/mid → black, else white
-        dense = _halftone_darkness(sign_field) > ROBUST_MAX_FIELD_DARKNESS
+        # ONE field tone per sign (median across the group's per-word fields), then
+        # apply the bright-line #808080 rule uniformly.
+        sign_field = float(np.median([c[4] for c in grp]))
+        polarity = "black" if sign_field >= POLARITY_THRESHOLD else "white"
         allink = np.zeros((H, W), bool)
         for c in grp:
-            allink |= c[3]
-        # ONE consistent field treatment for the whole sign.
-        if black:
-            if dense:    # uniform light lift of the sign's text field (not per-line blobs)
-                lr = max(3, int(np.median([c[4][3] - c[4][1] for c in grp]) * 0.45))
-                fz = cv2.dilate(allink.astype(np.uint8),
-                                _ellipse(lr)).astype(bool) & ~allink
-                out[fz] = np.maximum(out[fz], ROBUST_FIELD_LUMA)
-            out[allink] = 0
-        else:            # dark sign → white text on a uniformly darkened field
-            lr = max(3, int(np.median([c[4][3] - c[4][1] for c in grp]) * 0.45))
-            fz = cv2.dilate(allink.astype(np.uint8),
-                            _ellipse(lr)).astype(bool) & ~allink
-            out[fz] = np.minimum(out[fz], 28)
-            fixed |= fz
-            out[allink] = 255
-        fixed |= allink
-        for text, conf, contrast, _ink, bbox, _f in grp:
-            info["words"].append({"text": text, "conf": round(conf, 3),
-                                  "wcag_contrast": contrast})
-            bx0, by0, bx1, by1 = bbox
-            region[by0:by1, bx0:bx1] = 1
-    return out, fixed, region.astype(bool), info  # out is the recoloured COLOUR image
+            allink |= c[2]
+        # Hybrid policy: the OCR pass DECIDES polarity but only RENDERS when it
+        # actually adds something the binarizer/halftone wouldn't.
+        #   - polarity="black" + field is light (≥200): SKIP painting glyphs.
+        #     For doc scope the adaptive binarizer already renders this text at
+        #     its real stroke weight — painting solid-black over it just
+        #     thickens the segmenter's fatter ink mask. For image scope the
+        #     near-white field also triggers `halftone_exclude` (below) which
+        #     kicks the bbox out of the photo region, so the binarizer takes
+        #     over there too; same reasoning applies.
+        #   - polarity="white": always paint. The binarizer/halftone alone
+        #     would put black ink on a dark field — wrong polarity, illegible.
+        #   - polarity="black" + mid/dark field (<200): paint. On a tinted
+        #     block (or a coloured sign), the binarizer's output is unreliable
+        #     and the halftone can swallow the strokes.
+        skip_render = polarity == "black" and sign_field >= 200.0
+        if not skip_render:
+            if polarity == "black":
+                text_black |= allink
+            else:
+                text_white |= allink
+        if polarity == "black":
+            info["words_recolored_black"] += len(grp)
+        else:
+            info["words_recolored_white"] += len(grp)
+        for text, conf, _ink, bbox, field_gray, contrast in grp:
+            info["words"].append({
+                "text": text, "conf": round(conf, 3),
+                "polarity": polarity,
+                "rendered": not skip_render,
+                "field_gray": round(field_gray, 1),
+                "wcag_contrast": contrast,
+                "bbox": [int(bbox[0]), int(bbox[1]),
+                         int(bbox[2]), int(bbox[3])]})
+            # Where the word sits on a near-white field, mark its bbox so the
+            # caller can subtract it from the halftone region. This rescues
+            # doc-style text the photo segmenter pulled into the image scope:
+            # the field reads as a clean white plate around the recoloured
+            # glyphs instead of a halftone screen. Words on coloured fields
+            # (signage, tinted bars) stay on the halftone path so the field
+            # keeps its tone around the recoloured letters.
+            if field_gray >= 200.0:
+                bx0, by0, bx1, by1 = bbox
+                bh = max(1, by1 - by0)
+                pad = max(2, int(bh * 0.25))
+                hx0 = max(0, bx0 - pad); hy0 = max(0, by0 - pad)
+                hx1 = min(W, bx1 + pad); hy1 = min(H, by1 + pad)
+                halftone_exclude[hy0:hy1, hx0:hx1] = True
+    return text_black, text_white, halftone_exclude, info
 
 
 def _solid_fill_mask(g: np.ndarray, mean: np.ndarray,
@@ -961,9 +954,10 @@ def pre_sharpen(gray: np.ndarray, vdpi: int, amount: float = 0.7) -> np.ndarray:
 
 
 def _aniso_tile(tile: np.ndarray, hdpi: int, vdpi: int) -> np.ndarray:
-    """Resample a screen/threshold tile to the device pixel aspect so a dot is
-    round *on paper* (pixels are non-square: standard 2:1, fine 1:1, superfine
-    ~1:2). Vertical scale = vdpi/hdpi."""
+    """Identity passthrough since the pipeline now runs at SQUARE pixels (hdpi ==
+    vdpi). Kept for back-compat with callers that still pass two DPIs."""
+    if hdpi == vdpi:
+        return tile
     scale = vdpi / float(hdpi)
     th = max(2, int(round(tile.shape[0] * scale)))
     if th == tile.shape[0]:
@@ -1272,12 +1266,28 @@ DITHER_ALIASES = {"threshold": "none", "bayer": "ordered", "blue": "blue-noise",
                   "lines": "line"}
 
 
-def recommend_dither(photo_fraction: float, fax_heavy: bool) -> tuple:
-    """Suggest the OPTIMAL halftone for this page; returns (method, reason)."""
+def recommend_dither(photo_fraction: float, fax_heavy: bool,
+                     vdpi: int = 196) -> tuple:
+    """Suggest the OPTIMAL halftone for this page; returns (method, reason).
+
+    Below ~150 DPI render the page can't carry an AM/clustered screen at a
+    reasonable line-per-inch pitch — the cell would have to be 2 px to hit
+    50 lpi at 100 DPI, which has only 4 tone levels (so photos plug to mud).
+    For low-DPI rasters we recommend `blue-noise` instead: an isotropic FM
+    stipple whose dot pitch is one pixel, so the screen looks fine even at
+    96 DPI native. Once the render DPI clears ~150 (vector PDFs, high-res
+    scans), clustered/green-noise take back over for their longer black/white
+    runs and better G4 compression."""
     if photo_fraction < 0.03:
         return "none", ("Page is essentially text / line art (photo area "
                         f"{photo_fraction * 100:.0f}%); a hard threshold is the "
                         "sharpest and smallest — halftoning would only add noise.")
+    if vdpi < 150:
+        return "blue-noise", (f"Low-DPI raster source (~{vdpi} DPI render): "
+                              "blue-noise FM stipple lays one dot per pixel with "
+                              "no cell structure, so the screen looks fine and "
+                              "organic where a clustered cell would collapse to "
+                              "a chunky 25-lpi magazine pitch.")
     if fax_heavy or photo_fraction > 0.45:
         return "clustered", (f"Large photo area ({photo_fraction * 100:.0f}%) or "
                              "fax-heavy mode: clustered-dot keeps runs long, so it "
@@ -1289,10 +1299,11 @@ def recommend_dither(photo_fraction: float, fax_heavy: bool) -> tuple:
                            "to atkinson for the crispest whites on a clean line.")
 
 
-def choose_dither(name: str, fax_heavy: bool, photo_fraction: float) -> str:
+def choose_dither(name: str, fax_heavy: bool, photo_fraction: float,
+                  vdpi: int = 196) -> str:
     if name and name != "auto":
         return DITHER_ALIASES.get(name, name)
-    return recommend_dither(photo_fraction, fax_heavy)[0]
+    return recommend_dither(photo_fraction, fax_heavy, vdpi)[0]
 
 
 def halftone(gray: np.ndarray, name: str, hdpi: int, vdpi: int,
@@ -1360,17 +1371,23 @@ def detect_washout_colors(page: fitz.Page) -> list:
     return sorted(warns)
 
 
-def _compute_photo_region(page, gray, opt, hdpi, vdpi):
+def _compute_photo_region(page, gray, opt, hdpi, vdpi, rgb=None):
     """The continuous-tone (photo) region to halftone, before any text-keep masks
-    are subtracted. Shared by OCR/robust-text scoping and the final mask."""
+    are subtracted. Shared by OCR/robust-text scoping and the final mask.
+
+    `rgb` (optional) feeds the colour-aware photo discriminator inside
+    `variance_photo_mask` — for full-page wrapped rasters the chroma gate is
+    what keeps grayscale form-table cells and body-text rows out of the
+    halftone path (their variance alone is indistinguishable from a real
+    photo). For grayscale sources the gate self-disables."""
     if opt.segmentation == "none":
         return np.zeros_like(gray, dtype=bool)
     if opt.segmentation == "variance":
-        return variance_photo_mask(gray)
+        return variance_photo_mask(gray, rgb=rgb)
     mask = photo_region_mask(page, gray.shape, hdpi, vdpi,
                              opt.max_scanline_px, "embedded")
     if not mask.any():
-        return variance_photo_mask(gray)
+        return variance_photo_mask(gray, rgb=rgb)
     if mask.mean() > 0.8:
         # A single image covering (nearly) the whole page is a full-page raster (a
         # scan or exported cover sheet), not a photo. Halftoning all of it would
@@ -1379,7 +1396,7 @@ def _compute_photo_region(page, gray, opt, hdpi, vdpi):
         # inside the photo (a colored sign, sky) keep halftoning while the document's
         # text-on-white areas, outside the photo, are binarized crisp. (Empty result
         # = all text/line art → binarize everything, correct for a text-only scan.)
-        vmask = variance_photo_mask(gray)
+        vmask = variance_photo_mask(gray, rgb=rgb)
         if vmask.any():
             vmask = consolidate_photo_region(vmask, vdpi)
         mask = mask & vmask
@@ -1387,130 +1404,208 @@ def _compute_photo_region(page, gray, opt, hdpi, vdpi):
 
 
 def _prepare_page(page: fitz.Page, opt: FaxOptions):
-    """Rasterize + pre-clean a page and compute its photo mask, once.
+    """Rasterize a page at the effective (square) DPI, segment image areas, run
+    OCR in each scope to build the BLACK/WHITE text masks, and pre-clean the
+    grayscale.
 
-    Returns (gray, mask, photo_fraction, warnings, already_bilevel, rtext, otext).
-    The result is reused both by the real conversion and by the multi-method
-    comparison so every halftone option is rendered from an identical start.
-    """
-    hdpi, vdpi = RESOLUTIONS[opt.resolution]
+    Returns (gray, mask, photo_fraction, warnings, already_bilevel, doc_info,
+    image_info, text_black, text_white, eff_dpi). `mask` is the photo region the
+    halftone runs over; `text_black` and `text_white` are the layered text masks
+    composited over the bilevel result in `_apply_dither` so the halftone never
+    disturbs them; `eff_dpi` is the actual rendered DPI (single source of truth
+    for halftone parameters).
+
+    The result is reused by both the real conversion and the multi-method
+    comparison so every halftone option starts from an identical state."""
+    # The effective DPI is the SINGLE source of truth for both the rendered
+    # pixel grid AND every per-pixel mask we build on top of it. Passing the
+    # preset DPI (e.g. 391 for superfine) instead would scale the embedded
+    # image rectangles at the preset's scale and then stamp them into a buffer
+    # that `render_page_color` actually sized at the *effective* DPI (the
+    # MAX_RENDER_DPI ceiling, or whatever native DPI a raster source carries
+    # below it) — the rectangles land at the wrong size and the photo mask
+    # covers only a sub-rectangle of each image, so e.g. the top-left quadrant
+    # of an embedded photo gets halftoned and the rest gets hard-binarized
+    # into blocky shapes.
+    eff_dpi = _page_effective_dpi(page, opt)
     warnings: list = []
-    rtext: dict = {}
-    otext: dict = {}
+    doc_info: dict = {}
+    image_info: dict = {}
 
     if is_already_bilevel(page):
-        gray = render_page_gray(page, hdpi, vdpi, opt.max_scanline_px)
-        return gray, np.zeros_like(gray, dtype=bool), 0.0, warnings, True, rtext, otext
+        gray = render_page_gray(page, eff_dpi, eff_dpi, opt.max_scanline_px)
+        empty = np.zeros_like(gray, dtype=bool)
+        return (gray, empty, 0.0, warnings, True, doc_info, image_info,
+                empty, empty, eff_dpi)
 
-    # When text recolouring is on (the default), render in COLOUR first and derive
-    # the working grayscale from the *recoloured* colour image AFTER identifying and
-    # recolouring the text — so the recolour provably precedes the grayscale
-    # conversion. Only when both text passes are off do we render grayscale directly.
-    color_path = (opt.robust_image_text != "off" or opt.ocr_text != "off")
-    if color_path:
-        rgb = render_page_color(page, hdpi, vdpi, opt.max_scanline_px)
-        base_gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-    else:
-        rgb = None
-        base_gray = render_page_gray(page, hdpi, vdpi, opt.max_scanline_px)
+    # Always render in colour: OCR runs on the colour image. The colour buffer is
+    # never recoloured in place — the OCR pass produces glyph MASKS that ride a
+    # text layer composited above the halftoned image layer in the final assembly.
+    rgb = render_page_color(page, eff_dpi, eff_dpi, opt.max_scanline_px)
+    base_gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
 
     # The photo region scopes OCR and the final halftone mask. Compute it on a
     # flattened copy (near-white → white) so the document's text-on-white areas
-    # read as flat and stay OUT of the photo region — otherwise OCR would see, and
-    # re-typeset, the page's own crisp form text. It rides the deskew alongside the
-    # text-keep masks. Computed on the pre-recolour luminance (the original page).
+    # read as flat and stay OUT of the photo region — otherwise the page's own
+    # form text would be halftoned. It rides the deskew alongside the text masks.
     photo = _compute_photo_region(
         page, flatten_background(base_gray) if opt.flatten_bg else base_gray,
-        opt, hdpi, vdpi)
+        opt, eff_dpi, eff_dpi, rgb=rgb)
 
-    fixed_ocr = np.zeros(base_gray.shape, bool)
-    ocr_region = np.zeros(base_gray.shape, bool)
-    fixed = np.zeros(base_gray.shape, bool)
+    text_black = np.zeros(base_gray.shape, bool)
+    text_white = np.zeros(base_gray.shape, bool)
+    halftone_exclude = np.zeros(base_gray.shape, bool)
 
-    if color_path:
-        # (1) Identify text on the COLOUR image and recolour it IN COLOUR.
-        # OCR text recovery (optional, FIRST): recognise text baked into the photo
-        # and recolour its original glyphs — recovering words the signal path can't
-        # (e.g. a sign word in a specular highlight). What OCR recolours is excluded
-        # from the robust-text pass below so it isn't reprocessed.
+    def _count_rendered(info):
+        return sum(1 for w in info.get("words", []) if w.get("rendered"))
+
+    # OCR is the slow step (an inference pass per page). It is the engine for
+    # *both* the doc-text polarity recolour AND the within-image robust-text
+    # recolour, so it only ever runs when the user has opted into the
+    # robust-text feature (`opt.robust_image_text != "off"`). With robust-text
+    # off the chroma-aware photo segmenter routes form/body/footer text out of
+    # the halftone path on its own, and the binarizer's adaptive contrast
+    # threshold handles polarity inside white-paper text — so the OCR pass
+    # would be pure overhead (20+ minutes on a 6-page 391-DPI deck).
+    if opt.robust_image_text != "off":
+        # (1) Document text — pixels OUTSIDE the photo region. Apply the
+        # #808080 polarity rule to the page's own header/footer/form text:
+        # white-on-coloured bars, body text on tinted blocks, etc.
         if opt.ocr_text != "off":
-            rgb, fixed_ocr, ocr_region, otext = apply_ocr_text(
-                rgb, vdpi, photo, opt.ocr_conf_min)
-            if otext.get("words"):
-                warnings.append(f"ocr_text:recognized:{len(otext['words'])}")
-        # Robust image text: recolour washout-prone coloured text to solid black or
-        # solid white (polarity by field tone) directly in the colour buffer.
-        if opt.robust_image_text != "off":
-            rgb, fixed, rtext = apply_robust_image_text(
-                rgb, vdpi, opt.robust_image_text, opt.text_binarize,
-                opt.robust_text_stroke, skip_mask=ocr_region)
-            if rtext.get("regions_recovered"):
-                warnings.append(f"robust_text:recovered:{rtext['regions_recovered']}")
-        # (2) NOW convert to grayscale, from the recoloured colour image.
-        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-    else:
-        gray = base_gray
+            non_image = ~photo
+            d_black, d_white, d_excl, doc_info = apply_ocr_polarity(
+                rgb, non_image, opt.ocr_conf_min, scope="doc")
+            text_black |= d_black
+            text_white |= d_white
+            halftone_exclude |= d_excl
+            n_rend = _count_rendered(doc_info)
+            if n_rend:
+                warnings.append(f"doc_text:recolored:{n_rend}")
+
+        # (2) Robust image text — pixels INSIDE the photo region. Same
+        # #808080 rule, rescuing signage and captions baked into images.
+        i_black, i_white, i_excl, image_info = apply_ocr_polarity(
+            rgb, photo, opt.ocr_conf_min, scope="image")
+        text_black |= i_black
+        text_white |= i_white
+        halftone_exclude |= i_excl
+        n_rend = _count_rendered(image_info)
+        if n_rend:
+            warnings.append(f"image_text:recolored:{n_rend}")
+
+    # Words on a near-white field — typically doc text the photo segmenter
+    # pulled into the image scope — are removed from the halftone region so
+    # the field around them reads as a flat white plate. Coloured-field words
+    # (signage at field_gray < 200) stay on the halftone path so the sign keeps
+    # its tone.
+    if halftone_exclude.any():
+        photo = photo & ~halftone_exclude
+
+    gray = base_gray
 
     if opt.deskew:
-        gray, ang, (fixed, fixed_ocr, photo) = deskew_gray(
-            gray, [fixed, fixed_ocr, photo])
+        gray, ang, (photo, text_black, text_white) = deskew_gray(
+            gray, [photo, text_black, text_white])
         if ang:
             warnings.append(f"deskew:{ang:.1f}deg")
     if opt.flatten_bg:
         gray = flatten_background(gray)
 
     mask = photo
-    # Recovered/recolored text is crisp now: route it to the text binarizer, never
-    # the halftone, so it can't be screened back into mush.
-    keep = fixed | fixed_ocr
-    if keep.any():
-        mask = mask & ~keep
-
     photo_fraction = float(mask.mean()) if mask.size else 0.0
-    return gray, mask, photo_fraction, warnings, False, rtext, otext
+    return (gray, mask, photo_fraction, warnings, False, doc_info, image_info,
+            text_black, text_white, eff_dpi)
 
 
-def _apply_dither(gray, mask, dither_name, opt, hdpi, vdpi) -> np.ndarray:
-    """Binarize text/line content with the chosen adaptive binarizer, then
-    overlay the chosen halftone inside the photo mask only (bounded to its bbox).
-    Photo regions get dot-gain pre-correction and optional edge sharpening first,
-    so the channel renders the document well rather than just 'fax-ifying' it."""
-    text_bw = binarize_text(gray, opt.text_binarize, vdpi)
+def _apply_dither(gray, mask, dither_name, opt, hdpi, vdpi,
+                  text_black=None, text_white=None) -> np.ndarray:
+    """Build the bilevel page in three passes:
+
+    1. **Image layer** — halftone (or hard-threshold) inside the photo `mask`,
+       with optional dot-gain pre-correction and edge sharpening so photos read
+       cleanly through the channel.
+    2. **Document layer** — adaptive binarization for everything outside the
+       photo mask, so vector/document text stays crisp solid black.
+    3. **Text layer (composite ABOVE the others)** — `text_black` pixels are
+       forced solid black, `text_white` pixels solid white. This is the OCR-
+       driven recolor: the halftone screen never disturbs glyphs because they
+       are painted on top.
+
+    Pass `text_black=None`/`text_white=None` to skip the text layer (used by the
+    multi-panel sample's "halftone-only" frame)."""
+    # Low-DPI raster sources (a 792x1024 wrapped PNG renders at ~72 DPI) bake
+    # text as anti-aliased pixels, not vector glyphs — a thin stroke's edge
+    # pixels sit in the binarizer's grey-zone and either get dropped (the
+    # stroke vanishes, "B" reads as "8") or fragment (a "5" splits into two
+    # components and reads as "S"). A mild unsharp mask BEFORE binarization
+    # pushes those edge pixels toward solid black or solid white so the
+    # binarizer sees crisp edges. Only the text-binarize path is sharpened;
+    # the photo-region gray passed to the halftone is untouched, since
+    # `pre_sharpen` already runs there under `opt.sharpen` with its own knob.
+    gray_for_text = pre_sharpen(gray, vdpi, amount=1.2) if vdpi < 150 else gray
+    text_bw = binarize_text(gray_for_text, opt.text_binarize, vdpi)
     dither_name = DITHER_ALIASES.get(dither_name, dither_name)
-    if not mask.any() or dither_name == "none":
-        return text_bw
-    ys, xs = np.where(mask)
-    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
-    sub = gray[y0:y1, x0:x1]
-    if opt.sharpen:
-        sub = pre_sharpen(sub, vdpi)
-    sub = apply_tone_curve(sub, dither_name, opt.tone_curve)
-    sub_ht = halftone(sub, dither_name, hdpi, vdpi, opt.green_noise_coarseness)
-    if opt.text_in_image:
-        # Rescue text baked into the photo: where strokes form text lines, keep
-        # the legible binarization instead of the halftone so it stays readable.
-        tmask = text_in_image_mask(gray[y0:y1, x0:x1], vdpi)
-        if tmask.any():
-            sub_ht = np.where(tmask, text_bw[y0:y1, x0:x1], sub_ht)
     bw = text_bw.copy()
-    sub_mask = mask[y0:y1, x0:x1]
-    region = bw[y0:y1, x0:x1]
-    region[sub_mask] = sub_ht[sub_mask]
-    bw[y0:y1, x0:x1] = region
+
+    if mask.any() and dither_name != "none":
+        ys, xs = np.where(mask)
+        y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+        sub = gray[y0:y1, x0:x1]
+        if opt.sharpen:
+            sub = pre_sharpen(sub, vdpi)
+        sub = apply_tone_curve(sub, dither_name, opt.tone_curve)
+        sub_ht = halftone(sub, dither_name, hdpi, vdpi, opt.green_noise_coarseness)
+        # Heuristic text-in-image rescue runs ONLY when robust text is on. The
+        # default-mode contract is "image content rendered as-is" — the
+        # billboard, signage, and captions inside a photo are halftoned along
+        # with the rest of the picture, no special handling. Robust text is
+        # the user-opt-in switch that turns on text recovery inside images;
+        # this stroke-detector backs up the OCR pass for any words it missed.
+        if opt.text_in_image and opt.robust_image_text != "off":
+            tmask = text_in_image_mask(gray[y0:y1, x0:x1], vdpi)
+            if tmask.any():
+                sub_ht = np.where(tmask, text_bw[y0:y1, x0:x1], sub_ht)
+        sub_mask = mask[y0:y1, x0:x1]
+        region = bw[y0:y1, x0:x1]
+        region[sub_mask] = sub_ht[sub_mask]
+        bw[y0:y1, x0:x1] = region
+
+    # Composite the OCR-driven text layer ABOVE the halftone/binarize layers.
+    if text_black is not None and text_black.any():
+        bw[text_black] = 0
+    if text_white is not None and text_white.any():
+        bw[text_white] = 255
     return bw
 
 
 def process_page(page: fitz.Page, idx: int, opt: FaxOptions) -> tuple[Image.Image, PageReport]:
     rep = PageReport(index=idx)
-    hdpi, vdpi = RESOLUTIONS[opt.resolution]
-    gray, mask, photo_fraction, warnings, already, rtext, otext = _prepare_page(page, opt)
+    if opt.basic:
+        # BARE-MINIMUM PATH. Render at the page's effective DPI, desaturate, and
+        # Otsu-threshold. No MRC, no OCR, no flatten_bg, no deskew, no despeckle,
+        # no thicken — exactly the steps required to land 1-bit pixels in a G4
+        # frame, and nothing else. Provided as an escape hatch for users who
+        # want a predictable, debuggable, "just a fax" output, and as a
+        # reference baseline against which the full pipeline's enhancements can
+        # be visually compared. transmission_safe (the 1728-px clamp) still
+        # applies, because that's a hard channel constraint rather than an
+        # enhancement.
+        eff_dpi = _page_effective_dpi(page, opt)
+        gray = render_page_gray(page, eff_dpi, eff_dpi, opt.max_scanline_px)
+        bw = threshold_otsu(gray)
+        rep.dither = "none"
+        rep.text_binarize = "otsu"
+        rep.photo_fraction = 0.0
+        return _finalize_basic(bw, opt), rep
+    (gray, mask, photo_fraction, warnings, already, doc_info, image_info,
+     text_black, text_white, eff_dpi) = _prepare_page(page, opt)
     rep.warnings.extend(warnings)
     rep.photo_fraction = round(photo_fraction, 4)
     rep.text_binarize = opt.text_binarize
-    if rtext.get("regions_detected"):
-        rep.robust_text = rtext
-    if otext.get("words"):
-        rep.ocr_text = otext
+    if image_info.get("words"):
+        rep.robust_text = image_info
+    if doc_info.get("words"):
+        rep.ocr_text = doc_info
 
     if already:
         rep.already_bilevel = True
@@ -1518,58 +1613,125 @@ def process_page(page: fitz.Page, idx: int, opt: FaxOptions) -> tuple[Image.Imag
         return _finalize(threshold_otsu(gray), rep, opt), rep
 
     rep.photo_regions = int(mask.any())
-    dname = choose_dither(opt.dither, opt.fax_heavy, photo_fraction)
+    dname = choose_dither(opt.dither, opt.fax_heavy, photo_fraction, eff_dpi)
     rep.dither = dname
-    bw = _apply_dither(gray, mask, dname, opt, hdpi, vdpi)
+    bw = _apply_dither(gray, mask, dname, opt, eff_dpi, eff_dpi,
+                       text_black=text_black, text_white=text_white)
 
     if (bw == 0).mean() > 0.45:
         rep.warnings.append("inverted_or_heavy_black")
     rep.warnings.extend(detect_washout_colors(page))
-    return _finalize(bw.astype(np.uint8), rep, opt), rep
+    return _finalize(bw.astype(np.uint8), rep, opt, protect=mask), rep
 
 
-def _postclean(bw: np.ndarray, opt: FaxOptions) -> np.ndarray:
+def _postclean(bw: np.ndarray, opt: FaxOptions,
+               protect: np.ndarray | None = None) -> np.ndarray:
     if opt.despeckle:
-        bw = despeckle_bw(bw)
+        bw = despeckle_bw(bw, protect=protect)
     if opt.thicken:
         bw = thicken_bw(bw)
     return bw
 
 
-def _finalize(bw: np.ndarray, rep: PageReport, opt: FaxOptions) -> Image.Image:
-    # Pillow 1-bit: 0=black,255=white -> mode '1'
-    return Image.fromarray(_postclean(bw, opt)).convert("1")
+def _finalize(bw: np.ndarray, rep: PageReport, opt: FaxOptions,
+              protect: np.ndarray | None = None) -> Image.Image:
+    """Clean specks/thicken hairlines, optionally clamp to a Group-3 scanline
+    (1728 px) so a real fax machine can transmit it, and pack as a 1-bit image.
+
+    `protect`, if supplied, is the halftone region — single-pixel FM dots are
+    valid halftone content (a blue-noise screen IS a field of 1-px dots) and
+    must never be despeckled away."""
+    cleaned = _postclean(bw, opt, protect=protect)
+    img = Image.fromarray(cleaned).convert("1")
+    if opt.transmission_safe and img.width > 1728:
+        ratio = 1728 / img.width
+        new_h = max(1, int(round(img.height * ratio)))
+        img = img.convert("L").resize((1728, new_h), Image.LANCZOS)
+        img = img.point(lambda v: 0 if v < 160 else 255).convert("1")
+    return img
+
+
+def _finalize_basic(bw: np.ndarray, opt: FaxOptions) -> Image.Image:
+    """Pack a 1-bit image — no postclean, no enhancement. Honours
+    transmission_safe (a hard channel constraint, not an enhancement)."""
+    img = Image.fromarray(bw).convert("1")
+    if opt.transmission_safe and img.width > 1728:
+        ratio = 1728 / img.width
+        new_h = max(1, int(round(img.height * ratio)))
+        img = img.convert("L").resize((1728, new_h), Image.LANCZOS)
+        img = img.point(lambda v: 0 if v < 160 else 255).convert("1")
+    return img
 
 
 # --------------------------------------------------------------------------- #
 # Encoding / packing                                                          #
 # --------------------------------------------------------------------------- #
-def encode_g4_tiff(img: Image.Image, path: str) -> int:
-    img.save(path, format="TIFF", compression="group4")
+def encode_g4_tiff(img: Image.Image, path: str, dpi=None) -> int:
+    """Save a 1-bit page as a CCITT Group-4 TIFF. The (square) effective DPI is
+    written into the TIFF resolution tags so img2pdf — and any TIFF reader —
+    builds a correctly-proportioned PDF page. Without it img2pdf would assume a
+    72-dpi default and stretch the page."""
+    kw = {"format": "TIFF", "compression": "group4"}
+    if dpi is not None:
+        kw["dpi"] = (float(dpi[0]), float(dpi[1]))
+    img.save(path, **kw)
     return os.path.getsize(path)
 
 
-def convert_pdf(in_pdf: str, out_path: str, opt: FaxOptions) -> dict:
+def convert_pdf(in_pdf: str, out_path: str, opt: FaxOptions,
+                progress=None) -> dict:
     """Convert every page and write a G4 PDF or a Class-F multipage TIFF.
-    Returns the report dict."""
+
+    Processes pages STRICTLY one at a time: render → bilevel → encode page to
+    a G4 TIFF on disk → release the in-memory image → garbage-collect →
+    next page. Only the page's report dict survives the loop iteration; the
+    multi-megapixel intermediates (RGB buffer, gray buffer, photo/text masks,
+    PIL image) are dropped before the next page starts, so memory stays flat
+    at one page's worth even for a 100-page deck at the 300-PPI cap. After every
+    page is encoded, img2pdf concatenates the per-page TIFFs into the final
+    multipage PDF (or PIL writes the multipage TIFF), without ever loading
+    more than one page's pixels into RAM at a time.
+
+    `progress(i, n_pages, rep)` is called after each page is written, if
+    supplied — primarily so the CLI can stream status while a long deck
+    runs, but also handy for any caller that wants a progress bar.
+
+    Returns the consolidated report dict."""
+    import gc
     doc = fitz.open(in_pdf)
+    n_pages = doc.page_count
     tmpdir = tempfile.mkdtemp(prefix="faxopt_")
     tiff_paths, pages = [], []
 
-    for i, page in enumerate(doc, start=1):
+    for i in range(1, n_pages + 1):
+        page = doc[i - 1]
         img, rep = process_page(page, i, opt)
         tp = os.path.join(tmpdir, f"p{i:04d}.tif")
-        nbytes = encode_g4_tiff(img, tp)
+        # Effective DPI from actual pixels ÷ page inches, so the PDF carries the
+        # source aspect ratio regardless of which preset was used.
+        inch_w, inch_h = page.rect.width / 72.0, page.rect.height / 72.0
+        dpi = ((img.width / inch_w, img.height / inch_h)
+               if inch_w > 0 and inch_h > 0 else None)
+        nbytes = encode_g4_tiff(img, tp, dpi=dpi)
         rep.encoded_bytes = nbytes
         rep.est_transmission_s = round(
             nbytes * 8 / opt.line_rate_bps + opt.page_overhead_s, 1)
         tiff_paths.append(tp)
         pages.append(rep)
+        if progress is not None:
+            progress(i, n_pages, rep)
+        # Drop the in-memory page image before the next page starts. PyMuPDF's
+        # per-page caches are also reset by re-fetching the page object on
+        # each iteration above (instead of holding an iterator).
+        del img
+        gc.collect()
 
     if opt.fmt == "tiff":
         _save_multipage_tiff(tiff_paths, out_path)
     else:
-        # img2pdf embeds CCITT G4 losslessly (PDF carries CCITTFaxDecode)
+        # img2pdf embeds CCITT G4 losslessly (PDF carries CCITTFaxDecode).
+        # It streams each TIFF from disk page by page, never holding the
+        # whole deck's bilevel pixels in memory.
         with open(out_path, "wb") as f:
             f.write(img2pdf.convert(tiff_paths))
 
@@ -1590,8 +1752,12 @@ def convert_pdf(in_pdf: str, out_path: str, opt: FaxOptions) -> dict:
 def _save_multipage_tiff(tiff_paths, out_path):
     frames = [Image.open(p) for p in tiff_paths]
     first, rest = frames[0], frames[1:]
-    first.save(out_path, format="TIFF", compression="group4",
-               save_all=True, append_images=rest)
+    kw = dict(format="TIFF", compression="group4",
+              save_all=True, append_images=rest)
+    dpi = first.info.get("dpi")              # carry the per-page DPI through
+    if dpi:
+        kw["dpi"] = dpi
+    first.save(out_path, **kw)
 
 
 def render_preview(in_pdf: str, page_no: int, out_png: str, opt: FaxOptions):
@@ -1606,24 +1772,87 @@ def render_preview(in_pdf: str, page_no: int, out_png: str, opt: FaxOptions):
 def render_robust_text_preview(in_pdf: str, page_no: int, out_png: str,
                                opt: FaxOptions) -> dict:
     """Side-by-side proof that robust-image-text helped: the exact bilevel page as
-    it would fax WITHOUT the recolor (left) vs WITH it (right), so a human can
-    confirm the rescued text is now legible. Returns the per-region self-check."""
+    it would fax WITHOUT the within-image OCR recolor (left) vs WITH it (right).
+    Document-text OCR (outside images) stays on for both panels — only the
+    within-image robust pass is toggled, so the comparison isolates that effect.
+    Returns the recognised words and their polarity decisions."""
     import dataclasses
     off = dataclasses.replace(opt, robust_image_text="off")
     before, _ = process_page(fitz.open(in_pdf)[page_no - 1], page_no, off)
     after, rep = process_page(fitz.open(in_pdf)[page_no - 1], page_no, opt)
     rt = rep.robust_text or {}
-    rec = rt.get("regions_recovered", 0)
-    det = rt.get("regions_detected", 0)
+    nblack = rt.get("words_recolored_black", 0)
+    nwhite = rt.get("words_recolored_white", 0)
     metrics = {
         "before": {"original": True, "label": "WITHOUT robust text",
-                   "note": "colored/low-contrast text as a plain grayscale fax"},
+                   "note": "colored/low-contrast image text as a plain fax"},
         "after": {"original": True, "label": "WITH robust text",
-                  "note": f"{rec}/{det} region(s) recolored & verified legible"},
+                  "note": (f"{nblack} black + {nwhite} white word(s) recolored "
+                           "by the #808080 rule")},
     }
     _compose_contact_sheet([("before", before), ("after", after)],
                            metrics, recommended="after").save(out_png)
     return {"page": page_no, "output": out_png, "robust_text": rt}
+
+
+def render_sample(in_pdf: str, page_no: int, out_png: str,
+                  opt: FaxOptions) -> dict:
+    """Write a four-panel sample sheet showing exactly what the pipeline does:
+
+    a) ORIGINAL — the source page in colour, untouched.
+    b) GRAYSCALE — the same page desaturated, no other processing. This is the
+       continuous-tone input the 1-bit channel has to approximate.
+    c) HALFTONE ONLY — bilevel page with halftoning on image areas, document
+       text crisp via the binarizer, but no within-image robust-text recolor
+       (so signage stays as the channel sees it). Document-text OCR is still on
+       so headers/footers carry their #808080 polarity.
+    d) HALFTONE + ROBUST TEXT — the full pipeline, with within-image words
+       recoloured BLACK/WHITE per the #808080 rule and composited above the
+       halftoned image layer.
+
+    Panel c) reflects the user's options with robust text forced OFF; panel d)
+    forces robust text ON. The sheet's whole point is to show what robust text
+    does, so it's wired into d) regardless of the user's default — the *opt-in*
+    is for the actual conversion, not for the diagnostic sample."""
+    import dataclasses
+    doc = fitz.open(in_pdf)
+    page = doc[page_no - 1]
+    hdpi, vdpi = RESOLUTIONS[opt.resolution]
+    color = render_page_color(page, hdpi, vdpi, opt.max_scanline_px)
+    gray_ref = render_page_gray(page, hdpi, vdpi, opt.max_scanline_px)
+
+    no_robust = dataclasses.replace(opt, robust_image_text="off")
+    with_robust = dataclasses.replace(opt, robust_image_text="on")
+    halftone_img, ht_rep = process_page(page, page_no, no_robust)
+    full_img, full_rep = process_page(page, page_no, with_robust)
+
+    rt = full_rep.robust_text or {}
+    di = full_rep.ocr_text or {}
+    nblack = rt.get("words_recolored_black", 0)
+    nwhite = rt.get("words_recolored_white", 0)
+    docw = len(di.get("words", []))
+
+    panels = [
+        ("original", Image.fromarray(color, "RGB")),
+        ("grayscale", Image.fromarray(gray_ref).convert("L")),
+        ("halftone", halftone_img),
+        ("robust", full_img),
+    ]
+    metrics = {
+        "original":  {"original": True, "label": "a) ORIGINAL (color)",
+                      "note": "source page \u00b7 not a fax"},
+        "grayscale": {"original": True, "label": "b) GRAYSCALE",
+                      "note": "desaturated source \u00b7 not a fax"},
+        "halftone":  {"original": True, "label": "c) HALFTONE on image areas",
+                      "note": (f"document text crisp ({docw} word(s) by "
+                               "#808080); robust text OFF \u00b7 fax preview")},
+        "robust":    {"original": True, "label": "d) HALFTONE + ROBUST TEXT",
+                      "note": (f"image text recoloured: {nblack} black + "
+                               f"{nwhite} white \u00b7 fax preview")},
+    }
+    _compose_contact_sheet(panels, metrics, recommended="robust").save(out_png)
+    return {"page": page_no, "output": out_png,
+            "doc_text": di, "robust_text": rt}
 
 
 # --------------------------------------------------------------------------- #
@@ -1735,7 +1964,8 @@ def render_comparison(in_pdf: str, page_no: int, out_png: str, opt: FaxOptions,
     hdpi, vdpi = RESOLUTIONS[opt.resolution]
     doc = fitz.open(in_pdf)
     page = doc[page_no - 1]
-    gray, mask, photo_fraction, _warn, already, _rtext, _otext = _prepare_page(page, opt)
+    (gray, mask, photo_fraction, _warn, already, _di, _ii,
+     text_black, text_white, eff_dpi) = _prepare_page(page, opt)
 
     tmpdir = tempfile.mkdtemp(prefix="faxcmp_")
     panels, metrics = [], {}
@@ -1756,7 +1986,9 @@ def render_comparison(in_pdf: str, page_no: int, out_png: str, opt: FaxOptions,
                     "input each halftone below approximates.",
         }
     for m in methods:
-        bw = _postclean(_apply_dither(gray, mask, m, opt, hdpi, vdpi), opt)
+        bw = _postclean(_apply_dither(gray, mask, m, opt, eff_dpi, eff_dpi,
+                                      text_black=text_black,
+                                      text_white=text_white), opt)
         img = Image.fromarray(bw.astype(np.uint8)).convert("1")
         tp = os.path.join(tmpdir, f"{m}.tif")
         nbytes = encode_g4_tiff(img, tp)
@@ -1768,7 +2000,7 @@ def render_comparison(in_pdf: str, page_no: int, out_png: str, opt: FaxOptions,
         }
         panels.append((m, img))
 
-    rec, reason = recommend_dither(photo_fraction, opt.fax_heavy)
+    rec, reason = recommend_dither(photo_fraction, opt.fax_heavy, eff_dpi)
     if rec not in methods:  # ensure the recommended panel is shown/highlighted
         rec = min(methods, key=lambda k: metrics[k]["encoded_bytes"])
     _compose_contact_sheet(panels, metrics, rec).save(out_png)

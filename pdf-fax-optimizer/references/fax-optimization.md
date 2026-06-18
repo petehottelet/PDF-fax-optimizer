@@ -22,14 +22,11 @@ Group-3 fax (the near-universal standard) is fundamentally:
 
 - **1-bit bilevel** — every pixel is pure black or pure white. There is no gray.
   Any continuous tone must be *simulated* by patterns of black dots (halftoning).
-- **Fixed, anisotropic resolution** — horizontal is ~204 dpi; vertical is 98,
-  196, or 391 dpi depending on mode. The axes differ, so square resampling
-  distorts the page.
 - **Run-length compressed along each scanline** (CCITT/ITU-T: MH/MR/MMR, a.k.a.
   G3 1-D, G3 2-D, and G4). The encoder stores *runs* of same-color pixels per
   line.
 
-That last point drives most non-obvious decisions: **transition density is
+That second point drives most non-obvious decisions: **transition density is
 cost.** A scanline that alternates black/white frequently has many short runs →
 poor compression → longer transmission → more exposure to line errors (and on a
 1-D-coded line, an error corrupts the rest of that line). So the whole job is a
@@ -41,26 +38,61 @@ Everything below is a consequence of this.
 
 ## 2. Resolution & geometry
 
-Fax-native resolutions (horizontal × vertical dpi):
+The pipeline renders at the **source's NATIVE resolution with SQUARE pixels,
+hard-capped at 300 PPI**:
 
-| Mode | DPI (h×v) | Use |
+- A **raster source** (PNG, JPG, scanned page) renders at its native DPI
+  **exactly when below 300 PPI** — pixel-for-pixel with the source, no
+  upscale — and bicubic-downsamples to 300 PPI when its native DPI is higher.
+  Upscaling a wrapped raster bicubic-interpolates its baked-in text and soft
+  letterforms break the binarizer ("ABC" reads as "A8C"); the text quality is
+  *fundamentally* bounded by the source's pixel grid, so the pipeline never
+  renders above native. Halftone screen fineness at low native DPI is
+  recovered by picking an FM screen (`blue-noise` / `atkinson`) — its dot
+  pitch is the pixel itself, with no multi-pixel cell, so the screen looks
+  fine where a clustered cell would collapse to a chunky 24-lpi magazine
+  pitch. The recommender auto-picks the right family by render DPI.
+- A **vector source** (a real PDF, an Office document rendered to PDF) has no
+  native pixel grid, so it rasterizes square at the chosen preset (its glyphs
+  are real vectors the renderer rasterises crisp at any DPI), again clipped
+  to the 300-PPI ceiling:
+
+| `--fax-resolution` | Square render DPI (vector pages) | Use |
 |---|---|---|
-| `standard` | 204 × 98 | Fastest, lowest quality; text-only memos |
-| `fine` | 204 × 196 | Good default for mixed documents |
-| `superfine` | 204 × 391 | Best quality; small text, photos, fine detail |
+| `fine` | 196 dpi | Good default for mixed documents on a clean line |
+| **`superfine`** | **300 dpi** (nominal 391, clipped to ceiling) | **Default — best legibility for small text, signage, photos** |
+| `standard` | 98 dpi | Smallest output; text-only memos that don't need detail |
 
-Geometry rules the pipeline enforces:
+**Why 300 PPI is the cap.** 300 PPI is the legibility plateau of the 1-bit
+fax channel: real fax superfine is 196×391 anisotropic, real fine is 196×196
+— a square 300-PPI grid exceeds both on the scan-line axis. Rendering higher
+just makes the halftone CPU spend longer per pixel for no extra fidelity
+that the channel can carry, and a 600-PPI buffer for a 10-inch slide is 20+
+megapixels per page, vs. ~5 MP at the ceiling. Per-page buffers stay
+predictable: letter-size 8.5×11" → ~8 MP, 10×5.6" slide → ~5 MP, regardless
+of source resolution.
 
-- **Anisotropic resampling.** Render/resample horizontal and vertical axes
-  independently to the target dpi. Don't resample to a square grid and stretch.
-- **Max scanline width ≈ 1728 px** for A4/Letter at 204 dpi. Never exceed it;
-  clamp and re-fit.
-- **Standardize page size + safe margins.** Many machines crop the edges, so
-  pull content in from the physical edge.
-- **Match native resolution exactly to avoid moiré.** If you halftone at one
-  pitch and the receiver resamples at another, the two grids beat against each
-  other and produce interference patterns. Rendering straight to the fax grid
-  avoids this.
+The preset only sets:
+1. The square DPI **vector pages** rasterize at (clipped to 300 PPI).
+2. The halftone screen detail (dot cell size scales with the rendered DPI).
+
+A raster source's pixel grid is the rendered grid, full stop — the preset has
+no effect on raster sources.
+
+**Why we no longer use anisotropic fax DPIs.** Real Group-3 lines used
+non-square pixels (204×98 / 204×196 / 204×391); rendering anisotropically
+matched the wire format but distorted the page when shown on any modern viewer
+(square pixels), and forced an aspect-ratio recovery step everywhere. By
+rendering square at native resolution we keep the document correctly
+proportioned at every stage — TIFF, PDF, preview, sample sheet, OCR — at the
+cost that the rendered scanline can exceed the historical 1728-px cap. Pass
+**`--transmission-safe`** to clamp the final 1-bit output back to a 1728-px
+scanline so a real Group-3 fax machine can transmit it; without that flag the
+output is optimized for legibility, not strict G3 transmissibility (which is
+the right default in 2026, where most "fax" routes are PDF-over-API anyway).
+
+The (square) effective DPI is embedded in every output TIFF / PDF page, so
+img2pdf builds correctly-proportioned PDF pages without anisotropic correction.
 
 ---
 
@@ -122,11 +154,10 @@ means worse G4 compression, longer transmission, and more line-noise fragility.
 - **Ordered / Bayer (dispersed)** — cheap threshold-map method; between the
   others on both axes. Predictable, fast, no error propagation.
 
-**Anisotropic tuning.** Fax pixels are non-square (standard 2:1, fine 1:1,
-superfine ~1:2). Every screen schema (`clustered`, `ordered`, `blue-noise`,
-`green-noise`) resamples its threshold tile to the device aspect derived from
-`--fax-resolution` so a dot is round *on paper* and runs aren't distorted. No
-flag — it follows the resolution.
+**Square pixels.** Because the pipeline renders at square pixels (§2), screens
+are isotropic by construction — dots are round on paper without any anisotropic
+threshold-tile correction. The legacy aniso-tile helper is now an identity
+passthrough.
 
 **Dot-gain pre-correction (`--tone-curve auto`).** A 1-bit channel has large
 effective dot gain; without correction, midtones plug to solid black and a photo
@@ -246,44 +277,45 @@ Bilevel + low dpi quietly kills fine detail, so the pipeline actively defends it
   (Rec. 601/709), not a flat channel average. Watch colors that wash out:
   yellow highlights, light blue, light green, and red-on-dark can disappear or
   invert legibility. Warn when a page is dominated by such colors.
-- **Robust image text (chroma rescue).** Warning is not enough when the text
-  *only* differs from its background in hue — yellow on cyan is the canonical
-  case: both map to similar luminance, so desaturate-then-threshold erases the
-  glyphs no matter how the binarizer is tuned. The fix has to happen **in color,
-  before grayscale conversion**, because that is the only stage where the
-  discriminating signal (chroma) still exists. `--robust-text` finds baked-in
-  sign/image text as the **union of a chroma detector and a luminance detector**:
-  the chroma one catches light, low-luminance coloured text (high a/b contrast),
-  the luminance one catches darker baked-in text — and they are complementary,
-  because on a glossy sign one word reads by colour and the next by brightness, so
-  neither alone covers the whole line. Both run the same conservative
-  wide/short/dense text-line gate, **multi-scale** so thick signage strokes
-  register as well as thin body text. (Text on a near-white field is skipped — the
-  binarizer already renders document text crisp.) It segments glyph-vs-field with a
-  k=2 LAB clustering (ink = the **minority** colour cluster, since glyphs cover
-  less area than their field whether the text is the light element or the dark
-  one) and **recolors the glyphs to solid black** — restoring luminance contrast
-  directly. A backing is then added *only
-  where the background needs it*, judged by how dark the field will be **after
-  halftoning** (a mid grey screens to many dots, so the test models the screen,
-  not raw luma):
-  - a **light** field (a cyan sign greys light enough to screen ~¼ dots) carries
-    solid black on its own → nothing else is touched: it halftones normally, no
-    plate, no glow, no dither fringe;
-  - a **mid** field (a gold sign screens denser, ~⅓ dots, where black would drown)
-    gets a **clean thick solid white stroke** around the glyphs (binarized, so it
-    stays crisp — never a halftoned gradient), knocking them clear of the dots;
-  - a **too-dark** field can carry no solid-black treatment; since genuine
-    light-on-dark text keeps high luminance contrast and is never detected here,
-    these are almost always photo-chroma noise → rejected, never stamped.
+- **OCR-driven text recolor (the #808080 rule).** A fax is luminance-only, and
+  text that differs from its background mainly in hue (yellow on cyan), or in
+  saturation (cream on gold), is the canonical legibility failure: desaturate
+  it and the glyphs merge. The fix happens **in colour, before the bilevel
+  flatten**, by recoloring every recognised word's ORIGINAL glyph pixels to
+  SOLID BLACK or SOLID WHITE per a single bright-line rule:
 
-  Two more guards keep it honest: a region is committed only if its segmentation is
-  genuinely text-like (ink coverage in a sane band — rejects chroma noise from
-  foliage/gradients), and the composited result is re-binarized as a gross-failure
-  guard (revert anything that collapsed to a near-solid slab). The per-region
-  decision (`bg_luma`, `backing`) is reported under `robust_text`. `auto` acts only
-  when such text is present; on a normal black-on-white page nothing matches and it
-  is a no-op.
+  > *Median field luminance < 128 ⇒ text becomes WHITE; ≥ 128 ⇒ text becomes
+  > BLACK.*
+
+  That is the **#808080 rule** (luma 128 ↔ neutral mid-gray ↔ `#808080`). It is
+  applied uniformly to every word, in two scopes:
+
+  - **Document text (OUTSIDE images, `--ocr-text`)** — the page's
+    header/footer/form text. Rescues white-on-coloured headers, body text on
+    tinted blocks, and any place where the binarizer's default polarity would
+    flip the wrong way.
+  - **Image text (INSIDE images, `--robust-text`)** — signage, captions baked
+    into a photo. Polarity is decided **per sign** (words grouped by
+    proximity), so co-located words on the same plate get one consistent
+    treatment.
+
+  OCR (rapidocr-onnxruntime) is the **word locator only**, not a typesetter:
+  the recogniser's bounding box is used to crop, then each word's glyph pixels
+  are segmented from its OCR-box border ring (definitely field) — robust where
+  a blind 2-means split would invert. The original letterforms are preserved;
+  no synthetic font is ever pasted.
+
+  The recoloured glyphs ride a **text layer composited ABOVE** the halftoned
+  image layer, so the halftone screen can never disturb a glyph. There is no
+  field-lift, no field-darken, no stroke backing — the layered composite makes
+  those obsolete. Every recoloured word is reported under `robust_text.words` /
+  `ocr_text.words` with its confidence, polarity decision, and field
+  luminance, so the user can verify (OCR can misread).
+
+  Without OCR (`rapidocr-onnxruntime` not installed) the skill still works —
+  document text falls back to the binarizer's default black-on-white, the
+  within-image robust pass becomes a no-op, and the rest of the pipeline is
+  unchanged.
 
 ---
 
@@ -326,16 +358,19 @@ The output should be cheap and robust to send, not just small on disk:
 
 | Flag | Default | Why it exists |
 |---|---|---|
-| `--fax-resolution` | `fine` | Native dpi; anisotropic, avoids moiré |
+| `--fax-resolution` | **`superfine`** | Square halftone screen DPI; raster pages render at native (§2) |
+| `--transmission-safe` | off | Clamp final scanline to 1728 px for real Group-3 transmission (§2) |
 | `--dither` | `auto` | Photo halftone schema (§3); clustered, green-noise, blue-noise, atkinson, floyd, line/woodcut, ordered, edd, jarvis, stucki, sierra, none |
 | `--green-noise-coarseness` | `4.0` | AM↔FM knob for green-noise (~2 detail … 8 robust) (§3) |
 | `--text-binarize` | `contrast` | Binarizer for text/line content; `contrast` forces gray/light text to solid black; also sauvola, niblack, wolf, bradley, otsu (§4) |
 | `--tone-curve` | `auto` | Per-family dot-gain pre-correction so photos don't plug to black (§3) |
 | `--sharpen` | off | Edge-aware unsharp on photo regions before halftoning (§3) |
-| `--no-text-in-image` | (rescue on) | Disable rescue of text baked into photos; halftone the whole image region (§4) |
-| `--robust-text` | `auto` | Rescue washout-prone *colored* text (chroma-high, luminance-low) by recoloring to solid black, adding a stroke only if the background is too dark, + self-verify; `on` scans harder, `off` disables (§5) |
-| `--robust-text-stroke` | `0.15` | Thickness of the contrasting stroke (× glyph height) drawn only in the dark-background case; light/mid backgrounds get no backing (§5) |
-| `--robust-text-preview` | none | Write a before/after PNG of the page faxed without vs with the robust-text recolor (§5) |
+| `--no-text-in-image` | (rescue on) | Disable fallback rescue of text baked into photos (§4); the OCR-driven `--robust-text` is the primary path |
+| `--ocr-text` | `auto` | OCR-driven #808080 polarity for text OUTSIDE images (page header/footer/form text); `off` falls back to the binarizer (§5) |
+| `--robust-text` | `auto` | OCR-driven #808080 polarity for text INSIDE images (signage, captions); `off` disables (§5) |
+| `--ocr-conf` | `0.5` | Minimum OCR confidence to recolour a word |
+| `--sample` | none | Write a 4-panel preview: original / grayscale / halftone-only / halftone+robust-text |
+| `--robust-text-preview` | none | Side-by-side PNG faxed WITHOUT vs WITH the within-image robust recolor (§5) |
 | `--compare-page` | none | Render the curated 6-up of schemas to one contact sheet so a human can pick by eye (§3) |
 | `--compare-original` | off | Lead the sheet with original-color (#1) + true-grayscale (#2) references, then four halftones |
 | `--compare-methods` | curated | Override which schemas appear in the comparison |
@@ -353,8 +388,9 @@ The output should be cheap and robust to send, not just small on disk:
 
 ## Tooling notes
 
-- **PyMuPDF (fitz)** rasterizes pages (supports anisotropic render matrices),
-  enumerates embedded images and their rects, and detects already-bilevel images.
+- **PyMuPDF (fitz)** rasterizes pages at the chosen square DPI, enumerates
+  embedded images and their rects (used to compute the source's native DPI and
+  the photo region), and detects already-bilevel images.
 - **Pillow** does Floyd-Steinberg (`convert('1')`) and writes CCITT **G4** TIFF
   (`compression='group4'`).
 - **numpy / OpenCV** handle Atkinson/clustered/ordered dithering, background
@@ -368,6 +404,9 @@ The output should be cheap and robust to send, not just small on disk:
   text** via **LibreOffice headless** (`soffice --headless --convert-to pdf`).
   LibreOffice is optional and only needed for those office formats; everything
   downstream is unchanged because it always sees a PDF.
+- **rapidocr-onnxruntime** is the optional OCR backend that drives the
+  #808080 polarity passes (`--ocr-text`, `--robust-text`). It bundles its own
+  ONNX models, no system OCR binary required. When absent the skill silently
+  falls back to the binarizer's default black-on-white.
 - **Leptonica** (not installed here) is the production-grade choice for
-  bilevel/MRC/despeckle if you move this off the current box; Ghostscript's
-  `tiffg4` device + `-r204x196` is an alternative rasterizer when available.
+  bilevel/MRC/despeckle if you move this off the current box.
