@@ -380,7 +380,10 @@ def preserve_text_mask(rgb: np.ndarray,
                                 dark_thr: int = 110,
                                 min_dark_frac: float = 0.0,
                                 max_dark_frac: float = 0.50,
-                                pad: int = 4) -> np.ndarray:
+                                pad: int = 4,
+                                bg_luma_floor: int = 60,
+                                rel_dark_offset: int = 40,
+                                rel_dark_floor: int = 40) -> np.ndarray:
     """Find small saturated-colour fields that contain dark text strokes;
     return a mask of pixels to LIFT TO WHITE before binarization.
 
@@ -416,6 +419,11 @@ def preserve_text_mask(rgb: np.ndarray,
         the photo. 1.5% of page area covers normal slide / dashboard /
         form / report colored fields but excludes signage and banner-
         sized colour blocks.
+      - **Background luma above floor** (`bg_luma_floor`) — the chip's
+        75th-percentile luma must be at least 60. Below that the chip is
+        genuinely dark end-to-end and the rescue has nothing to lift to
+        white; the binarizer handles it the same as any other dark
+        region.
       - **Dark text density** inside the bbox bounded above by
         `max_dark_frac` — too many darks means a near-solid dark field
         (no text rescue possible) → leave alone. The lower bound is 0
@@ -423,6 +431,19 @@ def preserve_text_mask(rgb: np.ndarray,
         with no text, a coloured callout dot) also whiten cleanly —
         on a 1-bit channel colour is dead anyway and a black bar
         is a worse outcome than blank.
+
+    The dark threshold is **background-relative**: a pixel only counts
+    as text-stroke if its grayscale value is at least `rel_dark_offset`
+    luma below the chip's 75th-percentile luma (capped above by the
+    absolute `dark_thr` floor so bright-chip AA halos still catch). An
+    earlier absolute-only threshold rejected any chip whose own
+    background luma sat below 110 (e.g. a dark-blue "EBITDA" badge at
+    luma 108): the whole chip got counted as "text", `dark_frac`
+    saturated, and the rescue refused to fire — the chip then went out
+    as a solid-black knockout, which is the exact failure mode this
+    routine exists to prevent. Anchoring the threshold to the chip's
+    actual background fixes this for the full saturation range from
+    pale-yellow chips down to navy badges.
 
     Whitening uses the COMPONENT'S BOUNDING BOX (padded outward by
     `pad`) minus the dark text strokes — not just a dilation of the
@@ -468,11 +489,40 @@ def preserve_text_mask(rgb: np.ndarray,
         n_comp = int(comp.sum())
         if n_comp < 16:
             continue
+        # Background-relative dark threshold. An absolute floor like
+        # dark_thr=110 fails on any saturated colour whose grayscale luma
+        # itself sits below the floor — picture a dark-blue "EBITDA" chip
+        # at RGB(65,107,223) (luma 108). The whole chip is then counted
+        # as "dark text", dark_frac saturates near 1.0, exceeds
+        # max_dark_frac, and the chip is rejected from the rescue. It
+        # then falls through to the binarizer which paints it solid black
+        # because the dark-text-on-dark-fill scenario is exactly what
+        # this routine is supposed to protect against. The fix: anchor
+        # the threshold to the chip's actual background luma. Use the
+        # 75th percentile of the component's gray values as the
+        # background estimate (robust to text strokes occupying up to a
+        # quarter of the chip area), then call a pixel "text-dark" only
+        # if it's `rel_dark_offset` luma below that background. The
+        # absolute `dark_thr` floor is preserved as an upper bound so
+        # bright chips still capture their anti-aliased text halos
+        # (where pixel luma can be 90+) and don't slice the glyph
+        # outline.
+        chip_lumas = sub_gray[comp == 1]
+        bg_luma = int(np.percentile(chip_lumas, 75))
+        if bg_luma < bg_luma_floor:
+            # Chip is genuinely dark all the way through; preserve_text
+            # can't recover any text stroke here because there is no
+            # background to lift to white. Let the normal binarizer
+            # handle it (it'll go solid black, but there was never
+            # anything to rescue).
+            continue
+        effective_dark_thr = max(rel_dark_floor,
+                                 min(dark_thr, bg_luma - rel_dark_offset))
         # Dark-density gate. Too few darks = a plain colour swatch with no
         # text inside (a logo, a slide-deck accent block); too many = a
         # near-solid dark chip whose "text" is the chip itself. The middle
         # band is the text-on-colour signature.
-        dark_pixels = (sub_gray < dark_thr) & (comp == 1)
+        dark_pixels = (sub_gray < effective_dark_thr) & (comp == 1)
         n_dark = int(dark_pixels.sum())
         frac = n_dark / n_comp
         if not (min_dark_frac <= frac <= max_dark_frac):
@@ -491,7 +541,7 @@ def preserve_text_mask(rgb: np.ndarray,
         xbox0 = max(0, x0 - pad)
         ybox1 = min(h, y0 + hh + pad)
         xbox1 = min(w, x0 + ww + pad)
-        sub_dark_box = gray[ybox0:ybox1, xbox0:xbox1] < dark_thr
+        sub_dark_box = gray[ybox0:ybox1, xbox0:xbox1] < effective_dark_thr
         out[ybox0:ybox1, xbox0:xbox1] |= ~sub_dark_box
     return out
 
