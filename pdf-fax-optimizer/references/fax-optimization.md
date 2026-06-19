@@ -203,11 +203,21 @@ Decision guide (`recommend_dither`):
 
 - Photo area < 3% (essentially text/line-art) → `none` (hard threshold): sharpest
   and smallest; halftoning would only add noise.
-- Photo area > 45% or `--fax-heavy` → **clustered**: keep runs long so it
-  compresses and survives a noisy line.
-- Otherwise → **green-noise**: blue-noise-level detail but clustered into longer,
-  more bit-flip-tolerant runs; drop to `atkinson` for the crispest whites on a
-  clean line, or `blue-noise` for a softer isotropic look.
+- Render DPI < 150 → **blue-noise**: low-DPI rasters can't carry an AM cell at a
+  reasonable LPI; blue-noise lays one dot per pixel and looks fine even at 96 DPI
+  native.
+- `--fax-heavy` → **clustered**: keep runs long so it compresses and survives a
+  noisy line, at the cost of a visibly coarse screen on fine photo detail.
+- Otherwise → **green-noise** (regardless of photo fraction): blue-noise-level
+  detail in continuous-tone regions but clustered into longer, more
+  bit-flip-tolerant runs. Drop to `atkinson` for the crispest whites on a clean
+  line, or `blue-noise` for a softer isotropic look.
+
+Earlier revisions defaulted high-photo-area pages (>45%) to clustered for
+compression, but a fine-detail photo at 300 PPI through a 9-px clustered cell
+pitches the screen at a newsprint-coarse ~33 LPI and plugs the fine structure
+(e.g. a full-bleed photographic slide cover renders as a chunky AM dot
+pattern). Clustered is now opt-in via `--fax-heavy` only.
 
 `--dither auto` applies exactly this logic. But the recommendation is only a
 starting point — see *Spend your eye tokens* below.

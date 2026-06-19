@@ -374,9 +374,9 @@ def preserve_text_mask(rgb: np.ndarray,
                                 gray: np.ndarray,
                                 block: int = 24,
                                 chroma_lo: float = 12.0,
-                                max_area_frac: float = 0.04,
+                                max_area_frac: float = 0.015,
                                 dark_thr: int = 110,
-                                min_dark_frac: float = 0.04,
+                                min_dark_frac: float = 0.0,
                                 max_dark_frac: float = 0.50,
                                 pad: int = 4) -> np.ndarray:
     """Find small saturated-colour fields that contain dark text strokes;
@@ -402,15 +402,33 @@ def preserve_text_mask(rgb: np.ndarray,
     Detection (must satisfy *all*):
       - **High chroma** in the source RGB (`chroma_lo`) — saturated colour,
         not a barely-tinted gray. Subtle tints stay on the binarizer path.
-      - **Small area** (`max_area_frac` of page) — large coloured regions
-        are photos, illustrations, or full-bleed colour panels (e.g.
-        slide 6's lime backdrop) and have to keep their tone via the
-        halftone path, not get blanked.
-      - **Dark text density** inside the bbox between
-        `min_dark_frac`..`max_dark_frac` — too few dark pixels means a
-        plain coloured logo with no text inside (`min_dark_frac` skips
-        it); too many means a near-solid dark chip (no text rescue
-        possible) → leave alone.
+      - **Small area** (`max_area_frac` of page; ~1.5%) — large coloured
+        regions are photos, illustrations, full-bleed colour panels
+        (e.g. slide 6's lime backdrop), or signage on a billboard. Those
+        have to keep their tone via the halftone path, not get blanked.
+        The bound has to be tighter than a casual reader expects: a
+        billboard panel inside a photo can clear the chroma seed AND the
+        text-density gate but is far too big to whiten without erasing
+        the photo. 1.5% of page area covers normal slide / dashboard /
+        form pills but excludes signage and banner-sized colour blocks.
+      - **Dark text density** inside the bbox bounded above by
+        `max_dark_frac` — too many darks means a near-solid dark chip
+        (no text rescue possible) → leave alone. The lower bound is 0
+        by default so PURELY decorative accents (a thin lime stripe
+        with no text, a coloured callout dot) also whiten cleanly —
+        on a 1-bit channel colour is dead anyway and a black bar
+        is a worse outcome than blank.
+
+    Whitening uses the COMPONENT'S BOUNDING BOX (padded outward by
+    `pad`) minus the dark text strokes — not just a dilation of the
+    chroma seed. Dilating the seed by a few pixels misses the soft
+    outer fringe of an anti-aliased pill edge (where the chroma has
+    already faded below `chroma_lo`); that residual mid-gray ring sits
+    next to the now-pure-white pill interior and the `contrast`
+    binarizer's local-window statistics flip it to BLACK, drawing a
+    phantom border around the rescued label. Whitening the whole
+    bbox guarantees the halo is captured. The bbox is already capped
+    by `max_area_frac`, and `~dark_pixels` keeps the actual glyphs.
 
     Returns a bool mask over the page; the caller bitwise-ANDs with
     `~photo_region` so the rescue never touches actual photo content."""
@@ -454,21 +472,21 @@ def preserve_text_mask(rgb: np.ndarray,
         frac = n_dark / n_comp
         if not (min_dark_frac <= frac <= max_dark_frac):
             continue
-        # Whiten only the FILL — component minus dark text strokes. Whiten-
-        # ing the strokes too erases the very text we're trying to rescue
-        # (the original bug: the labels vanished alongside their pills). A
-        # small outward dilation of the fill catches the anti-aliased ring
-        # around the pill so the binarizer doesn't draw a faint border.
-        fill = (comp == 1) & ~dark_pixels
-        if pad > 0:
-            fill_u8 = fill.astype(np.uint8)
-            fill_u8 = cv2.dilate(
-                fill_u8,
-                cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
-                                          (pad * 2 + 1, pad * 2 + 1)))
-            # ...but never re-include the protected dark strokes.
-            fill = fill_u8.astype(bool) & ~dark_pixels
-        out[y0:y0 + hh, x0:x0 + ww] |= fill
+        # Whiten the entire bounding box (with a small outer pad to absorb
+        # the very last fringe of anti-aliasing past the chroma seed),
+        # MINUS the dark text strokes. The bbox approach is far more
+        # robust than dilating the seed: a 4-px dilation can't catch the
+        # full soft halo of an anti-aliased pill — its outermost pixels
+        # have already faded below `chroma_lo` so they're not in the
+        # seed, but they're still mid-gray, and the `contrast` text
+        # binarizer flips them to BLACK against the surrounding white
+        # interior, painting a phantom border around the rescued label.
+        ybox0 = max(0, y0 - pad)
+        xbox0 = max(0, x0 - pad)
+        ybox1 = min(h, y0 + hh + pad)
+        xbox1 = min(w, x0 + ww + pad)
+        sub_dark_box = gray[ybox0:ybox1, xbox0:xbox1] < dark_thr
+        out[ybox0:ybox1, xbox0:xbox1] |= ~sub_dark_box
     return out
 
 
@@ -1708,9 +1726,16 @@ def recommend_dither(photo_fraction: float, fax_heavy: bool,
     50 lpi at 100 DPI, which has only 4 tone levels (so photos plug to mud).
     For low-DPI rasters we recommend `blue-noise` instead: an isotropic FM
     stipple whose dot pitch is one pixel, so the screen looks fine even at
-    96 DPI native. Once the render DPI clears ~150 (vector PDFs, high-res
-    scans), clustered/green-noise take back over for their longer black/white
-    runs and better G4 compression."""
+    96 DPI native.
+
+    Once we clear the low-DPI band, `green-noise` is the default for any page
+    with photo content: it keeps blue-noise-level detail in continuous-tone
+    regions (a fine-detail photo at 300 PPI through a 9-px clustered cell
+    pitches the screen at a newsprint-coarse ~33 LPI and plugs all the
+    fine structure), while still clustering dots into runs long enough to
+    survive a real line. Pure `clustered` is reserved for `--fax-heavy`,
+    where the user has explicitly opted into maximum compression and
+    line-noise robustness over rendered detail."""
     if photo_fraction < 0.03:
         return "none", ("Page is essentially text / line art (photo area "
                         f"{photo_fraction * 100:.0f}%); a hard threshold is the "
@@ -1721,15 +1746,18 @@ def recommend_dither(photo_fraction: float, fax_heavy: bool,
                               "no cell structure, so the screen looks fine and "
                               "organic where a clustered cell would collapse to "
                               "a chunky 25-lpi magazine pitch.")
-    if fax_heavy or photo_fraction > 0.45:
-        return "clustered", (f"Large photo area ({photo_fraction * 100:.0f}%) or "
-                             "fax-heavy mode: clustered-dot keeps runs long, so it "
-                             "compresses best and survives a noisy line.")
-    return "green-noise", (f"Moderate photo area ({photo_fraction * 100:.0f}%): "
-                           "green-noise hybrid keeps blue-noise-level detail but "
-                           "clusters dots into longer runs, so it compresses and "
-                           "survives the line far better than Floyd/Atkinson. Drop "
-                           "to atkinson for the crispest whites on a clean line.")
+    if fax_heavy:
+        return "clustered", ("Fax-heavy mode: clustered-dot keeps runs long, so "
+                             "it compresses best and survives a noisy line — at "
+                             "the cost of a visibly coarse screen on fine photo "
+                             "detail.")
+    return "green-noise", (f"Photo area {photo_fraction * 100:.0f}%: green-noise "
+                           "hybrid keeps blue-noise-level detail in continuous-"
+                           "tone regions while clustering dots into longer runs, "
+                           "so it compresses and survives the line far better "
+                           "than Floyd/Atkinson. Drop to atkinson for the "
+                           "crispest whites on a clean line; switch to clustered "
+                           "via --fax-heavy if you need maximum G4 compression.")
 
 
 def choose_dither(name: str, fax_heavy: bool, photo_fraction: float,
@@ -1976,6 +2004,52 @@ def _prepare_page(page: fitz.Page, opt: FaxOptions):
         if n_rend:
             warnings.append(f"image_text:recolored:{n_rend}")
 
+        # (3) Per-glyph LOCAL STAGE. Replace the gray plane in a thin
+        # halo-sized envelope around each recovered glyph's silhouette
+        # (NOT the full word bbox) so the halftone paints a smooth screen
+        # only where the letterform + contrasting-glow halo actually sits.
+        # The rest of the bbox keeps its halftone, so the underlying photo
+        # (billboard panel, sign, building) keeps its natural texture
+        # instead of being replaced wholesale by a uniform gray plate.
+        #
+        # Why the envelope and not the bbox: OCR returns a phrase-level
+        # bbox per word ("VILLA DEL SOL"), which on a wide sign covers
+        # almost the entire panel. Flattening the bbox = flattening the
+        # whole sign. Flattening a glyph-dilation = a thin smooth-tone
+        # silhouette that hugs the letters and gives the halo a clean
+        # background, while the gaps between letters and the area past
+        # the halo retain the photo's halftone.
+        #
+        # Envelope radius scales with vdpi so the visual margin past the
+        # halo (`glow_px = vdpi/100`) is constant on paper.
+        if image_info and image_info.get("words"):
+            glyph = i_black | i_white
+            if glyph.any():
+                glow_px = max(1, int(round(eff_dpi / 100)))
+                # halo radius + 2 px breathing room. Tight, but enough that
+                # the halo always lands on flattened pixels.
+                stage_r = glow_px + 2
+                k = stage_r * 2 + 1
+                stage_kernel = cv2.getStructuringElement(
+                    cv2.MORPH_ELLIPSE, (k, k))
+                stage = cv2.dilate(glyph.astype(np.uint8),
+                                   stage_kernel).astype(bool)
+                base_gray_flat = base_gray.copy()
+                n_flat = 0
+                for w in image_info["words"]:
+                    if not w.get("rendered"):
+                        continue
+                    bx0, by0, bx1, by1 = w["bbox"]
+                    sub_stage = stage[by0:by1, bx0:bx1]
+                    if not sub_stage.any():
+                        continue
+                    base_gray_flat[by0:by1, bx0:bx1][sub_stage] = \
+                        int(round(w["field_gray"]))
+                    n_flat += 1
+                if n_flat:
+                    base_gray = base_gray_flat
+                    warnings.append(f"image_text:field_flattened:{n_flat}")
+
     # Words on a near-white field — typically doc text the photo segmenter
     # pulled into the image scope — are removed from the halftone region so
     # the field around them reads as a flat white plate. Coloured-field words
@@ -2057,11 +2131,48 @@ def _apply_dither(gray, mask, dither_name, opt, hdpi, vdpi,
         region[sub_mask] = sub_ht[sub_mask]
         bw[y0:y1, x0:x1] = region
 
-    # Composite the OCR-driven text layer ABOVE the halftone/binarize layers.
+    # Composite the OCR-driven text layer ABOVE the halftone/binarize layers,
+    # each glyph wrapped in a CONTRASTING-GLOW halo of opposite polarity so
+    # the letterforms read against ANY underlying tone. The halo costs only
+    # the dilation ring around each stroke and is invisible when the
+    # underlying field already matches the halo polarity (black text on a
+    # light page: the white halo merges into the page; white text on a dark
+    # halftone field: the black halo creates a sharp keyline that makes the
+    # white stroke pop). It replaces the older "lift the whole bbox to
+    # opposite polarity" path that knocked out hundreds of kilopixels of
+    # surrounding image content on signage (a teal billboard with gold text
+    # would lose its entire panel to one big white rectangle). The halo
+    # gives the same legibility for ~1% of the pixels.
+    #
+    # Halo + stroke thickness both SCALE WITH RENDER DPI so the visual
+    # weight on paper (≈0.5 pt outline) is constant across resolutions
+    # — a fixed 3×3 kernel that looks fine at 110 PPI disappears at
+    # 300 PPI, which is why the v3 billboard composite "looked terrible"
+    # on the hi-res preview earlier.
+    glow_px = max(1, int(round(vdpi / 100)))         # 1 px @ 100 DPI, 3 px @ 300 DPI
+    halo_k = glow_px * 2 + 1
+    halo_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (halo_k, halo_k))
+    # Recovered glyph strokes are 1-px-thin at low DPI sources; the channel
+    # eats them. Dilate by 1 px at <200 DPI to give the stroke survival
+    # margin (matches the existing `--thicken` rationale).
+    thicken_strokes = vdpi < 200
+    if thicken_strokes:
+        thick_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     if text_black is not None and text_black.any():
-        bw[text_black] = 0
+        tb = text_black
+        if thicken_strokes:
+            tb = cv2.dilate(tb.astype(np.uint8), thick_kernel).astype(bool)
+        halo = cv2.dilate(tb.astype(np.uint8), halo_kernel).astype(bool) & ~tb
+        bw[halo] = 255
+        bw[tb] = 0
     if text_white is not None and text_white.any():
-        bw[text_white] = 255
+        tw = text_white
+        if thicken_strokes:
+            tw = cv2.dilate(tw.astype(np.uint8), thick_kernel).astype(bool)
+        halo = cv2.dilate(tw.astype(np.uint8), halo_kernel).astype(bool) & ~tw
+        bw[halo] = 0
+        bw[tw] = 255
     return bw
 
 
@@ -2404,6 +2515,39 @@ def _oswald_font(size: int, weight: str = "Bold"):
     return _load_font(size)
 
 
+def _wrap_text(text: str, font, max_w: int, max_lines: int = 2) -> list[str]:
+    """Greedy word-wrap to `max_lines` lines at most `max_w` pixels wide.
+
+    A single overflowing word is forced onto its own line (so we never hang).
+    If there's still text left when we hit `max_lines`, the final line is
+    truncated with a horizontal ellipsis. Returns a list of strings.
+    """
+    words = text.split()
+    if not words:
+        return [""]
+    lines: list[str] = []
+    cur: list[str] = []
+    i = 0
+    while i < len(words) and len(lines) < max_lines:
+        w = words[i]
+        trial = " ".join(cur + [w]) if cur else w
+        if not cur or font.getbbox(trial)[2] <= max_w:
+            cur.append(w)
+            i += 1
+        else:
+            lines.append(" ".join(cur))
+            cur = []
+    if cur:
+        lines.append(" ".join(cur))
+    if i < len(words) and lines:                  # ran out of lines, ellipsize
+        ell = "\u2026"
+        tail = lines[-1]
+        while tail and font.getbbox(tail + ell)[2] > max_w:
+            tail = tail[:-1].rstrip()
+        lines[-1] = (tail + ell) if tail else ell
+    return lines
+
+
 def _compose_contact_sheet(panels, metrics, recommended, cell_w=480):
     """panels: list of (method_name, PIL '1' image). Returns an RGB contact
     sheet with a labeled, metric-annotated panel per method."""
@@ -2414,7 +2558,13 @@ def _compose_contact_sheet(panels, metrics, recommended, cell_w=480):
         ch = max(1, int(rgb.height * (cell_w / rgb.width)))
         rendered.append((name, rgb.resize((cell_w, ch), Image.LANCZOS)))
 
-    cap, pad, title_h = 58, 18, 18
+    # cap (header strip height) sized for a 22 pt label line + TWO 15 pt note
+    # lines + a few px of trailing padding. The two-line note row is required
+    # because per-panel notes such as `document text crisp (24 word(s) by
+    # #808080); recover-text OFF · fax preview` won't fit a 480-px cell on
+    # one line and the old single-line layout was hard-truncating them mid
+    # word at the cell edge.
+    cap, pad, title_h = 76, 18, 18
     cols = 3 if len(rendered) > 4 else max(1, len(rendered))
     rows = (len(rendered) + cols - 1) // cols
     cell_h = max(r.height for _, r in rendered)
@@ -2423,6 +2573,8 @@ def _compose_contact_sheet(panels, metrics, recommended, cell_w=480):
     canvas = Image.new("RGB", (W, H), (255, 255, 255))
     d = ImageDraw.Draw(canvas)
     lf, sf = _oswald_font(22, "SemiBold"), _load_font(15)
+    note_max_w = cell_w - 20
+    note_line_h = 18
 
     for i, (name, rgb) in enumerate(rendered):
         r, c = divmod(i, cols)
@@ -2438,16 +2590,20 @@ def _compose_contact_sheet(panels, metrics, recommended, cell_w=480):
         else:
             header = (228, 228, 228)
         d.rectangle([x, y, x + cell_w, y + cap], fill=header)
-        label = (m.get("label", name.upper()) if is_orig
-                 else name.upper() + ("   >> RECOMMENDED <<" if is_rec else ""))
-        d.text((x + 10, y + 6), label, font=lf, fill=(10, 10, 10))
-        if is_orig:
-            d.text((x + 10, y + 34), m.get("note", "source \u00b7 not a fax"),
-                   font=sf, fill=(70, 70, 70))
-        else:
-            d.text((x + 10, y + 34),
-                   f"{m.get('encoded_bytes', 0) / 1024:.0f} KB  \u00b7  "
-                   f"~{m.get('est_transmission_s', 0):.0f}s / page",
+        label_text = (m.get("label", name.upper()) if is_orig
+                      else name.upper() + ("   >> RECOMMENDED <<" if is_rec
+                                           else ""))
+        # Label rarely needs wrapping but keep the guard so an unusually long
+        # method name (e.g. "FLOYD-STEINBERG   >> RECOMMENDED <<") doesn't
+        # bleed into the next cell either.
+        label_lines = _wrap_text(label_text, lf, cell_w - 20, max_lines=1)
+        d.text((x + 10, y + 6), label_lines[0], font=lf, fill=(10, 10, 10))
+        note_text = (m.get("note", "source \u00b7 not a fax") if is_orig else
+                     (f"{m.get('encoded_bytes', 0) / 1024:.0f} KB  \u00b7  "
+                      f"~{m.get('est_transmission_s', 0):.0f}s / page"))
+        note_lines = _wrap_text(note_text, sf, note_max_w, max_lines=2)
+        for li, line in enumerate(note_lines):
+            d.text((x + 10, y + 34 + li * note_line_h), line,
                    font=sf, fill=(70, 70, 70))
         canvas.paste(rgb, (x, y + cap))
         d.rectangle([x, y, x + cell_w, y + cap + rgb.height],

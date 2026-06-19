@@ -33,3 +33,6 @@ intake.fax.preview_p1.png
 
 # Local working / design assets (not part of the published skill)
 00_Project_Files/
+
+# README demo cache (regenerable via 00_Project_Files/_run_readme_demo.py)
+docs/readme/raw/
