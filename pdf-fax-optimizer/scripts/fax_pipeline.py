@@ -91,15 +91,17 @@ class FaxOptions:
     green_noise_coarseness: float = 4.0  # green-noise AM<->FM knob (~2..8)
     text_in_image: bool = True      # rescue text baked into photos (don't halftone it)
     recover_text: str = "off"   # off|on|auto  OCR-driven recolor of text inside images (opt-in)
-    # Heuristic rescue for dark text sitting on a small saturated-colour
-    # "highlight pill" (label chips on slides, status badges in dashboards,
-    # form-field highlights, etc.). In grayscale the bright fill collapses to
-    # a mid-tone the contrast binarizer treats as "dark field, light text",
-    # flips polarity, and shreds the glyphs. With this on, the pill is
-    # lifted to white BEFORE binarization so the dark text reads cleanly.
-    # Off-by-default would have left a default-mode user with broken labels
-    # on slide decks — the failure was loud enough that it warrants the
-    # default-on heuristic (matches the existing text_in_image policy).
+    # Heuristic rescue for dark text sitting on ANY small saturated-colour
+    # fill that loses contrast in grayscale: slide highlight chips, status
+    # badges on dashboards, colored table cells, tinted callout boxes,
+    # colored form fields, filled banners. In grayscale the bright fill
+    # collapses to a mid-tone the contrast binarizer treats as "dark field,
+    # light text", flips polarity, and shreds the glyphs. With this on, the
+    # colored field is lifted to white BEFORE binarization so the dark text
+    # reads cleanly. Off-by-default would have left a default-mode user
+    # with broken labels on slide decks and dashboards — the failure was
+    # loud enough that it warrants the default-on heuristic (matches the
+    # existing text_in_image policy).
     preserve_text: bool = True
     recover_text_stroke: float = 0.15  # retained for back-compat; unused in the OCR/#808080 path
     ocr_text: str = "auto"           # off|auto|on  OCR-driven polarity for ALL page text
@@ -382,21 +384,23 @@ def preserve_text_mask(rgb: np.ndarray,
     """Find small saturated-colour fields that contain dark text strokes;
     return a mask of pixels to LIFT TO WHITE before binarization.
 
-    The motivating failure mode: a slide / form / dashboard places a label
-    inside a coloured "highlight pill" (text BLACK on a saturated lime /
-    orange / cyan / blue chip). The original page is high-contrast and
-    legible. After RGB→gray demotion the bright fill collapses to a
-    mid-tone (~140 luma) and dark text on a dark-ish field has too little
-    contrast to survive: the `contrast` text binarizer sees the pill as a
-    "dark field with light text", flips polarity, paints the pill solid
-    black, and knocks the glyphs out — they arrive as a mangled cross-
-    hatch that's effectively illegible on the receiving end.
+    The motivating failure mode: a page places dark text on top of ANY
+    saturated-colour fill — a highlight chip behind a slide label, a
+    status badge in a dashboard, a colored cell in a table, a tinted
+    callout box, a colored form field, a filled banner. The original
+    page is high-contrast and legible. After RGB→gray demotion the bright
+    fill collapses to a mid-tone (~140 luma) and dark text on a dark-ish
+    field has too little contrast to survive: the `contrast` text
+    binarizer sees the colored area as a "dark field with light text",
+    flips polarity, paints it solid black, and knocks the glyphs out —
+    they arrive as a mangled crosshatch that's effectively illegible on
+    the receiving end.
 
-    The cure: in the gray image, drop the pill's tone to white. The black
-    text now reads as crisp black-on-white and binarizes cleanly. We
-    sacrifice the "this is a highlight" visual cue, but on a 1-bit fax
-    channel that cue was going to die anyway — the trade is a legible
-    label for a colour we couldn't render. Same playbook as the
+    The cure: in the gray image, drop the field's tone to white. The
+    black text now reads as crisp black-on-white and binarizes cleanly.
+    We sacrifice the "this is colored" visual cue, but on a 1-bit fax
+    channel that cue was going to die anyway — the trade is legible
+    text for a colour we couldn't render. Same playbook as the
     photo-region exclude: prefer text legibility over decorative tone.
 
     Detection (must satisfy *all*):
@@ -404,15 +408,16 @@ def preserve_text_mask(rgb: np.ndarray,
         not a barely-tinted gray. Subtle tints stay on the binarizer path.
       - **Small area** (`max_area_frac` of page; ~1.5%) — large coloured
         regions are photos, illustrations, full-bleed colour panels
-        (e.g. slide 6's lime backdrop), or signage on a billboard. Those
+        (e.g. a slide's lime backdrop), or signage on a billboard. Those
         have to keep their tone via the halftone path, not get blanked.
         The bound has to be tighter than a casual reader expects: a
         billboard panel inside a photo can clear the chroma seed AND the
         text-density gate but is far too big to whiten without erasing
         the photo. 1.5% of page area covers normal slide / dashboard /
-        form pills but excludes signage and banner-sized colour blocks.
+        form / report colored fields but excludes signage and banner-
+        sized colour blocks.
       - **Dark text density** inside the bbox bounded above by
-        `max_dark_frac` — too many darks means a near-solid dark chip
+        `max_dark_frac` — too many darks means a near-solid dark field
         (no text rescue possible) → leave alone. The lower bound is 0
         by default so PURELY decorative accents (a thin lime stripe
         with no text, a coloured callout dot) also whiten cleanly —
@@ -422,11 +427,11 @@ def preserve_text_mask(rgb: np.ndarray,
     Whitening uses the COMPONENT'S BOUNDING BOX (padded outward by
     `pad`) minus the dark text strokes — not just a dilation of the
     chroma seed. Dilating the seed by a few pixels misses the soft
-    outer fringe of an anti-aliased pill edge (where the chroma has
+    outer fringe of an anti-aliased fill edge (where the chroma has
     already faded below `chroma_lo`); that residual mid-gray ring sits
-    next to the now-pure-white pill interior and the `contrast`
+    next to the now-pure-white field interior and the `contrast`
     binarizer's local-window statistics flip it to BLACK, drawing a
-    phantom border around the rescued label. Whitening the whole
+    phantom border around the rescued text. Whitening the whole
     bbox guarantees the halo is captured. The bbox is already capped
     by `max_area_frac`, and `~dark_pixels` keeps the actual glyphs.
 
@@ -441,8 +446,8 @@ def preserve_text_mask(rgb: np.ndarray,
         return np.zeros((h, w), bool)
 
     # Per-pixel saturation gate then morph-close so the text strokes inside
-    # the pill (which sample the dark glyph colour, not the saturated fill)
-    # don't punch holes in the detected region.
+    # the colored field (which sample the dark glyph colour, not the
+    # saturated fill) don't punch holes in the detected region.
     seed = (chroma > chroma_lo).astype(np.uint8)
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (block, block))
     seed = cv2.morphologyEx(seed, cv2.MORPH_CLOSE, k)
@@ -476,11 +481,12 @@ def preserve_text_mask(rgb: np.ndarray,
         # the very last fringe of anti-aliasing past the chroma seed),
         # MINUS the dark text strokes. The bbox approach is far more
         # robust than dilating the seed: a 4-px dilation can't catch the
-        # full soft halo of an anti-aliased pill — its outermost pixels
-        # have already faded below `chroma_lo` so they're not in the
-        # seed, but they're still mid-gray, and the `contrast` text
-        # binarizer flips them to BLACK against the surrounding white
-        # interior, painting a phantom border around the rescued label.
+        # full soft halo of an anti-aliased colored fill edge — its
+        # outermost pixels have already faded below `chroma_lo` so
+        # they're not in the seed, but they're still mid-gray, and the
+        # `contrast` text binarizer flips them to BLACK against the
+        # surrounding white interior, painting a phantom border around
+        # the rescued text.
         ybox0 = max(0, y0 - pad)
         xbox0 = max(0, x0 - pad)
         ybox1 = min(h, y0 + hh + pad)
@@ -1939,8 +1945,9 @@ def _prepare_page(page: fitz.Page, opt: FaxOptions):
         page, flatten_background(base_gray) if opt.flatten_bg else base_gray,
         opt, eff_dpi, eff_dpi, rgb=rgb)
 
-    # Highlight-pill rescue. Find small saturated-colour fields outside the
-    # photo region that contain dark text strokes, and lift them to white
+    # Preserve-text rescue. Find small saturated-colour fields outside the
+    # photo region that contain dark text strokes (highlight chips, badges,
+    # callouts, colored cells, filled banners, …), and lift them to white
     # in BOTH the gray (for the binarizer) and the RGB (so OCR, if it runs
     # later, sees the same field tone and skips painting white glyphs on
     # what's now a light-field word). This is the cure for the slide-4
@@ -2515,31 +2522,87 @@ def _oswald_font(size: int, weight: str = "Bold"):
     return _load_font(size)
 
 
-def _wrap_text(text: str, font, max_w: int, max_lines: int = 2) -> list[str]:
-    """Greedy word-wrap to `max_lines` lines at most `max_w` pixels wide.
+_WRAP_BREAK_CHARS = ";:,."           # word-final clause punctuation
+_WRAP_BREAK_TOKENS = {"\u00b7",      # middle-dot, em-dash, en-dash, pipe
+                      "\u2014", "\u2013", "|"}
 
-    A single overflowing word is forced onto its own line (so we never hang).
-    If there's still text left when we hit `max_lines`, the final line is
-    truncated with a horizontal ellipsis. Returns a list of strings.
+
+def _wrap_text(text: str, font, max_w: int, max_lines: int = 2) -> list[str]:
+    """Word-wrap with CLAUSE-AWARE break preference.
+
+    Standard greedy wrap finds the rightmost fit per line, which produces
+    visually ugly orphans when a long string almost fits — e.g.
+    `…recover-text OFF · fax | preview` orphans the trailing `preview`.
+
+    This wrapper does greedy first, then on every line EXCEPT the final
+    one scans backward for a "preferred" break right after end-of-clause
+    punctuation (`;:,.·`) or a standalone separator token (`·`, em/en
+    dash, pipe). If a preferred break exists *and* taking it would still
+    leave at least 50 % of `max_w` filled, it wins. The result is wraps
+    that land on natural clause boundaries instead of in the middle of a
+    thought. Final-line overflow is truncated with a horizontal ellipsis.
     """
     words = text.split()
     if not words:
         return [""]
+
+    def line_w(seg):
+        return font.getbbox(" ".join(seg))[2]
+
+    def ends_clause(w):
+        """End of a clause: a word terminating in `;:,.·`, possibly with a
+        trailing closing bracket (`#808080);`, `[foo],`, etc.)."""
+        if not w:
+            return False
+        if w[-1] in _WRAP_BREAK_CHARS:
+            return True
+        if len(w) >= 2 and w[-1] in ")]}\u00bb" and w[-2] in _WRAP_BREAK_CHARS:
+            return True
+        return False
+
+    def is_separator(w):
+        return w in _WRAP_BREAK_TOKENS
+
     lines: list[str] = []
-    cur: list[str] = []
     i = 0
     while i < len(words) and len(lines) < max_lines:
-        w = words[i]
-        trial = " ".join(cur + [w]) if cur else w
-        if not cur or font.getbbox(trial)[2] <= max_w:
-            cur.append(w)
-            i += 1
-        else:
-            lines.append(" ".join(cur))
-            cur = []
-    if cur:
-        lines.append(" ".join(cur))
-    if i < len(words) and lines:                  # ran out of lines, ellipsize
+        # Greedy: rightmost word that still fits.
+        best_j = i
+        while best_j < len(words) and line_w(words[i:best_j + 1]) <= max_w:
+            best_j += 1
+        best_j -= 1
+        if best_j < i:                              # single overflow word
+            best_j = i
+        is_last_line = len(lines) == max_lines - 1
+        if not is_last_line:
+            # Phase 1: prefer a clause-end break (word ending in `;:,.·`).
+            # We scan strictly backward so the earliest clause break that
+            # still keeps the line ≥ 40 % full wins — beats the stranded
+            # `·` case where greedy stops on a standalone separator.
+            preferred = None
+            for k in range(best_j, i - 1, -1):
+                if ends_clause(words[k]):
+                    preferred = k
+                    break
+            # Phase 2: fall back to a standalone separator break (e.g. `·`)
+            # only if it's NOT at the very end of the greedy line — we
+            # don't want to strand a `·` at the right edge.
+            if preferred is None:
+                for k in range(best_j - 1, i - 1, -1):
+                    if is_separator(words[k]):
+                        preferred = k
+                        break
+            if (preferred is not None and preferred != best_j and
+                    line_w(words[i:preferred + 1]) >= max_w * 0.4):
+                best_j = preferred
+            elif is_separator(words[best_j]) and best_j > i:
+                # Greedy ended on a stranded separator — push it to the
+                # next line so the break lands on the previous word.
+                best_j -= 1
+        lines.append(" ".join(words[i:best_j + 1]))
+        i = best_j + 1
+
+    if i < len(words) and lines:                   # ran out of lines
         ell = "\u2026"
         tail = lines[-1]
         while tail and font.getbbox(tail + ell)[2] > max_w:
@@ -2558,13 +2621,21 @@ def _compose_contact_sheet(panels, metrics, recommended, cell_w=480):
         ch = max(1, int(rgb.height * (cell_w / rgb.width)))
         rendered.append((name, rgb.resize((cell_w, ch), Image.LANCZOS)))
 
-    # cap (header strip height) sized for a 22 pt label line + TWO 15 pt note
-    # lines + a few px of trailing padding. The two-line note row is required
-    # because per-panel notes such as `document text crisp (24 word(s) by
-    # #808080); recover-text OFF · fax preview` won't fit a 480-px cell on
-    # one line and the old single-line layout was hard-truncating them mid
-    # word at the cell edge.
-    cap, pad, title_h = 76, 18, 18
+    # Header layout. `inset` is a uniform horizontal padding for label +
+    # note; `label_top` and `note_top` are the y-offsets within the band.
+    # The vertical rhythm:
+    #   - generous gap between heading (22 pt SemiBold) and subheading so
+    #     the subheading reads as a *separate* line of metadata, not a
+    #     stuck-on second line of the label;
+    #   - tight line-leading inside the subheading (≈1.27× the 15 pt
+    #     size) so wrapped notes look like one continuous thought instead
+    #     of two disconnected sentences with a big gap between them.
+    inset = 16
+    label_top = 14
+    note_top = 41                              # 27 px after label_top (was 42; -35%)
+    note_line_h = 19                           # tight subheading leading
+    cap = note_top + 2 * note_line_h + 6       # 85 px header band
+    pad, title_h = 18, 18
     cols = 3 if len(rendered) > 4 else max(1, len(rendered))
     rows = (len(rendered) + cols - 1) // cols
     cell_h = max(r.height for _, r in rendered)
@@ -2573,8 +2644,7 @@ def _compose_contact_sheet(panels, metrics, recommended, cell_w=480):
     canvas = Image.new("RGB", (W, H), (255, 255, 255))
     d = ImageDraw.Draw(canvas)
     lf, sf = _oswald_font(22, "SemiBold"), _load_font(15)
-    note_max_w = cell_w - 20
-    note_line_h = 18
+    note_max_w = cell_w - 2 * inset
 
     for i, (name, rgb) in enumerate(rendered):
         r, c = divmod(i, cols)
@@ -2596,15 +2666,16 @@ def _compose_contact_sheet(panels, metrics, recommended, cell_w=480):
         # Label rarely needs wrapping but keep the guard so an unusually long
         # method name (e.g. "FLOYD-STEINBERG   >> RECOMMENDED <<") doesn't
         # bleed into the next cell either.
-        label_lines = _wrap_text(label_text, lf, cell_w - 20, max_lines=1)
-        d.text((x + 10, y + 6), label_lines[0], font=lf, fill=(10, 10, 10))
+        label_lines = _wrap_text(label_text, lf, note_max_w, max_lines=1)
+        d.text((x + inset, y + label_top), label_lines[0],
+               font=lf, fill=(10, 10, 10))
         note_text = (m.get("note", "source \u00b7 not a fax") if is_orig else
                      (f"{m.get('encoded_bytes', 0) / 1024:.0f} KB  \u00b7  "
                       f"~{m.get('est_transmission_s', 0):.0f}s / page"))
         note_lines = _wrap_text(note_text, sf, note_max_w, max_lines=2)
         for li, line in enumerate(note_lines):
-            d.text((x + 10, y + 34 + li * note_line_h), line,
-                   font=sf, fill=(70, 70, 70))
+            d.text((x + inset, y + note_top + li * note_line_h), line,
+                   font=sf, fill=(36, 36, 36))
         canvas.paste(rgb, (x, y + cap))
         d.rectangle([x, y, x + cell_w, y + cap + rgb.height],
                     outline=(38, 148, 38) if is_rec else (178, 178, 178),

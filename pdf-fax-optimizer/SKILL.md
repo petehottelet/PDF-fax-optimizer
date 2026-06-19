@@ -148,21 +148,22 @@ What the pipeline does, per page (details in the reference):
    field — which is correct for the overwhelmingly common case. OCR is the
    escape hatch for white-on-coloured headers, signage inside photos, and
    captions baked into screenshots.
-4. **Preserve-text rescue (default on, no OCR needed).** When a slide /
-   dashboard / form puts dark text inside a *small saturated-colour chip*
-   (e.g. a lime / orange / cyan / blue "highlight pill" behind a label),
-   the bright fill collapses to a mid-tone in grayscale and the contrast
-   binarizer flips polarity — it paints the chip solid black and knocks the
-   text out as a mangled crosshatch. The preserve-text pass runs ahead of
-   the binarizer: small (`< 4%` of page), high-chroma, low-variance regions
+4. **Preserve-text rescue (default on, no OCR needed).** When dark text
+   sits on *any saturated-colour fill* — a highlight chip behind a slide
+   label, a tinted callout box, a colored table cell, a status badge in a
+   dashboard, a filled banner, a colored form field — the bright fill
+   collapses to a mid-tone in grayscale and the contrast binarizer flips
+   polarity, painting the field solid black and knocking the text out as
+   a mangled crosshatch. The preserve-text pass runs ahead of the
+   binarizer: small (`< 4%` of page), high-chroma, low-variance regions
    that carry dark text strokes get **lifted to white in the gray image**
    so the dark text reads as crisp black-on-white through the standard
    binarize path. The "this is a highlight" colour cue is sacrificed —
-   on 1-bit fax it was going to die anyway — and the label survives. Large
-   colour panels and photo content are protected by the area cap and the
-   `~photo` mask; the rescue never touches the photo region. Disable with
-   `--no-preserve-text` if you'd rather keep the chip as a halftoned tone
-   band.
+   on 1-bit fax it was going to die anyway — and the text survives.
+   Large colour panels and photo content are protected by the area cap
+   and the `~photo` mask; the rescue never touches the photo region.
+   Disable with `--no-preserve-text` if you'd rather keep the fill as a
+   halftoned tone band.
 5. **Pre-clean:** flatten near-white backgrounds to pure white, despeckle, and
    deskew (the photo mask and text masks ride the deskew rotation).
 6. **Build the bilevel page in three layers, composited in this order:**

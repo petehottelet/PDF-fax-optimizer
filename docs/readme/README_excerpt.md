@@ -21,11 +21,19 @@ billboard logo.
 
 ### Text rescue features
 
-`preserve_text` (default-on) whitens colored "highlight pill" backgrounds so
-the dark text on top reads cleanly through the 1-bit threshold. `recover_text`
-(default-off; opt-in with `--recover-text on`) uses OCR to find text inside
-halftoned image regions and recolors it BLACK or WHITE by the **#808080 rule**,
-compositing the recolored glyphs ABOVE the halftone layer.
+`preserve_text` (default-on) rescues dark text that sits on **any
+saturated-color background** that would otherwise lose contrast on the way
+to a 1-bit fax — slide-deck highlight chips, dashboard status badges,
+colored table cells, tinted callout boxes, color-filled banners. In
+grayscale these fills collapse to a mid-tone the contrast binarizer reads
+as "dark field, light text" and the glyphs get knocked out. With
+`preserve_text` on, the colored field is lifted to white **before**
+binarization so the dark text reads as crisp black-on-white.
+
+`recover_text` (default-off; opt-in with `--recover-text on`) uses OCR to
+find text inside halftoned image regions and recolors it BLACK or WHITE
+by the **#808080 rule**, compositing the recolored glyphs ABOVE the
+halftone layer.
 
 <p align="center">
   <img src="docs/readme/text_rescue.png" alt="Text rescue features — preserve_text and recover_text before/after" width="100%">

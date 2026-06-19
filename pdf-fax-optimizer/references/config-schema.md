@@ -57,17 +57,20 @@ omitted keys fall back to the documented defaults.
                                   //   the binarized value instead of the halftone.
                                   //   The OCR-driven recover_text below is the
                                   //   primary path; this is a safety net.
-    "preserve_text": true,        // pre-binarize rescue for dark text on a small
-                                  //   saturated-colour chip ("Active accounts" on a
-                                  //   lime pill, status badge on an orange pill).
-                                  //   The chip is lifted to white in the gray image
-                                  //   so the dark text reads as crisp black-on-white
-                                  //   through the standard binarize path; without it
-                                  //   the chip's mid-tone confuses the contrast
-                                  //   binarizer which flips polarity and shreds the
-                                  //   label. Photos and large colour panels are
-                                  //   protected by an area cap. Set false to keep
-                                  //   the chip as a halftoned tone band.
+    "preserve_text": true,        // pre-binarize rescue for dark text sitting on
+                                  //   ANY small saturated-colour fill that loses
+                                  //   contrast in grayscale: slide highlight chips,
+                                  //   dashboard status badges, colored table cells,
+                                  //   tinted callout boxes, color-filled banners,
+                                  //   colored form fields. The fill is lifted to
+                                  //   white in the gray image so the dark text
+                                  //   reads as crisp black-on-white through the
+                                  //   standard binarize path; without it the fill's
+                                  //   mid-tone confuses the contrast binarizer
+                                  //   which flips polarity and shreds the text.
+                                  //   Photos and large colour panels are protected
+                                  //   by an area cap. Set false to keep the fill
+                                  //   as a halftoned tone band.
     "ocr_text": "auto",           // OCR-driven #808080 polarity for text OUTSIDE
                                   //   images (page header/footer/form text). "auto"
                                   //   runs when an OCR engine is available; "off"

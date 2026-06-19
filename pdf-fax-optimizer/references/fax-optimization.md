@@ -295,27 +295,29 @@ to the right converter.
   binarized value instead of the screen. It is conservative by design — it would
   rather miss faint text than carve harsh blobs out of ordinary photo detail —
   and is on by default (`--no-text-in-image` to disable).
-- **Text on a coloured "highlight pill"** → lifted to white before binarization.
-  Slide decks, dashboards, and forms routinely place dark labels inside a
-  saturated colour chip (a "Pipeline growth" label on a lime pill, a status
-  badge on an orange pill, a glossary tag on a cyan pill, …). In the original
-  page the contrast is fine — bright chip, dark text. After RGB→gray demotion
-  the bright fill collapses to a mid-tone (~140 luma), and dark text on a
-  dark-ish field has too little contrast to survive: the contrast binarizer
-  sees the pill as "dark field with light text", flips polarity, paints the
-  chip solid black, and knocks the glyphs out as a mangled crosshatch — the
-  label is effectively illegible. `preserve_text_mask` runs before
+- **Dark text on any coloured / filled background** → lifted to white before
+  binarization. Slide decks, dashboards, forms, reports, and infographics
+  routinely place dark text on top of a saturated-colour fill: highlight
+  chips behind slide labels, status badges on dashboards, colored table
+  cells, tinted callout boxes, color-banded section headers, filled
+  banners, colored form fields. In the original page the contrast is fine
+  — bright fill, dark text. After RGB→gray demotion the bright fill
+  collapses to a mid-tone (~140 luma), and dark text on a dark-ish field
+  has too little contrast to survive: the contrast binarizer sees the
+  fill as "dark field with light text", flips polarity, paints the field
+  solid black, and knocks the glyphs out as a mangled crosshatch — the
+  text is effectively illegible. `preserve_text_mask` runs before
   the binarizer: connected components that satisfy *all three* of (a) high
   chroma in the source RGB, (b) area below ~4% of the page, and (c) a dark-
   pixel density in the text-stroke band (4 – 50%) get **lifted to white in the
   gray image** (and in the RGB the OCR pass would see, so an enabled recover-
-  text pass agrees on the field tone). The pill loses its colour cue — there
-  is no way to keep that on a 1-bit channel — but the dark text now reads as
-  clean black-on-white through the standard binarize path. Large coloured
-  panels and full-page photo content are protected by the area cap and the
-  `~photo` AND-mask; the rescue never touches the photo region. Default on;
-  disable with `--no-preserve-text` when you'd rather keep the chip as a
-  halftoned tone band (e.g. a stencil-print look).
+  text pass agrees on the field tone). The colour cue is sacrificed —
+  there is no way to keep that on a 1-bit channel — but the dark text now
+  reads as clean black-on-white through the standard binarize path. Large
+  colour panels and full-page photo content are protected by the area cap
+  and the `~photo` AND-mask; the rescue never touches the photo region.
+  Default on; disable with `--no-preserve-text` when you'd rather keep
+  the colored fill as a halftoned tone band (e.g. a stencil-print look).
 
 The pipeline detects photo regions from the PDF's **embedded raster image
 rectangles** (`page.get_image_rects`) rather than guessing from pixels — robust,

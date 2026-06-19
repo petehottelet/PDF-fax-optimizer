@@ -136,14 +136,17 @@ def main():
     p.add_argument("--no-preserve-text",
                    dest="preserve_text",
                    action="store_false", default=None,
-                   help="don't lift small saturated-colour 'highlight pills' to "
-                        "white before binarization. By default, dark text "
-                        "sitting on a coloured chip (e.g. dashboard labels on "
-                        "lime/orange/cyan/blue pills) gets rescued: the chip "
-                        "is flattened to white so the binarizer sees crisp "
-                        "black-on-white and prints the label legibly instead "
-                        "of mangling it. Disable with this flag if you'd "
-                        "rather keep the chip as a halftoned tone band")
+                   help="don't lift small saturated-colour fields containing "
+                        "dark text to white before binarization. By default, "
+                        "any colored fill that would lose contrast in "
+                        "grayscale and shred the dark text on top — slide "
+                        "highlight chips, dashboard status badges, colored "
+                        "table cells, tinted callout boxes, filled banners — "
+                        "gets rescued: the fill is flattened to white so the "
+                        "binarizer sees crisp black-on-white and prints the "
+                        "text legibly instead of mangling it. Disable with "
+                        "this flag if you'd rather keep the fill as a "
+                        "halftoned tone band")
     p.add_argument("--recover-text", choices=["auto", "on", "off"], default=None,
                    dest="recover_text",
                    help="rescue text baked INSIDE images (signage, captions): OCR "
