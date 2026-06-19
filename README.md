@@ -139,12 +139,23 @@ lossy transmission. The skill ships these schemas, spanning the design space:
 
 | `--dither` | Family | Detail | G4 size | Noise robustness |
 |---|---|---|---|---|
-| `clustered` | AM screening (clustered-dot) | low–med | **best** | **best** |
-| `green-noise` | hybrid AM–FM (clustered FM) | med–high | good | good |
+| `clustered` | AM screening — round clustered-dot | low–med | **best** | **best** |
+| `screen --dot-shape square` | AM screening — square dot | low–med | **best** | **best** |
+| `screen --dot-shape diamond` | AM screening — diamond dot (newspaper-photo classic) | low–med | **best** | **best** |
+| `screen --dot-shape ellipse` | AM screening — ellipse dot (smooth midtone joins) | low–med | **best** | **best** |
+| `mezzotint` | AM grain — random stippling (expressive; not eligible for `auto`) | med | **worst** | low |
+| `ordered` | Bayer ordered (matrix dither) | med | med | med |
 | `blue-noise` | FM screening (void-and-cluster) | **high** | medium | medium |
-| `atkinson` | error diffusion (6/8) | high | med | low–med |
-| `floyd` | error diffusion | **highest** | **worst** | **worst** |
+| `green-noise` | hybrid AM–FM (clustered FM) | med–high | good | good |
+| `floyd` | error diffusion (4-tap Floyd-Steinberg) | **highest** | **worst** | **worst** |
+| `atkinson` | error diffusion (6/8 Atkinson, clean whites) | high | med | low–med |
+| `jarvis` | error diffusion (12-tap Jarvis-Judice-Ninke, very smooth) | high | poor | low–med |
+| `stucki` | error diffusion (12-tap Stucki, sharp + smooth) | high | poor | low–med |
+| `sierra` | error diffusion (12-tap Sierra, lighter Jarvis) | high | poor | low–med |
+| `edd` | edge-enhancing error diffusion (high-pass + diffusion) | high | med | low–med |
 | `line` (`woodcut`) | horizontal line screen (engraving) | med | **best** | **best** |
+| `crosshatch` | layered angled line screens (pen-and-ink etching) | med | good | good |
+| `none` | hard threshold (no halftone) | — | **best** | **best** |
 
 `green-noise` is the standout addition for a real fax line — blue-noise detail
 with clustered-dot run-length/robustness, tunable via `--green-noise-coarseness`
@@ -153,8 +164,9 @@ thicken with darkness — because the strokes run *along the scanline* it is the
 most G4-friendly way to carry a photo and reads as a clean engraving, never mud.
 Because the pipeline runs at square pixels, the screens are isotropic by
 construction — dots stay round on paper without any anisotropic correction.
-(`ordered`, `edd` edge-enhancing diffusion, `jarvis`, `stucki`, `sierra`, and
-`none`/threshold are also selectable.)
+`mezzotint` is an expressive screen — it gives velvety midtones but has no
+spatial coherence, so it compresses poorly and isn't eligible for the auto-picker;
+it has to be requested explicitly.
 
 Every screen in the registry, applied to the same letter cover sheet —
 **`floyd`, `jarvis`, and `edd` are highlighted as the OPTIMAL picks** for a
