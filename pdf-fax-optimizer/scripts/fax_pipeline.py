@@ -132,6 +132,7 @@ class PageReport:
     already_bilevel: bool = False
     recover_text: dict = field(default_factory=dict)
     ocr_text: dict = field(default_factory=dict)
+    photo_features: dict = field(default_factory=dict)
     warnings: list = field(default_factory=list)
 
 
@@ -383,7 +384,8 @@ def preserve_text_mask(rgb: np.ndarray,
                                 pad: int = 4,
                                 bg_luma_floor: int = 60,
                                 rel_dark_offset: int = 40,
-                                rel_dark_floor: int = 40) -> np.ndarray:
+                                rel_dark_floor: int = 40,
+                                solid_chroma_density: float = 0.55) -> np.ndarray:
     """Find small saturated-colour fields that contain dark text strokes;
     return a mask of pixels to LIFT TO WHITE before binarization.
 
@@ -468,10 +470,16 @@ def preserve_text_mask(rgb: np.ndarray,
 
     # Per-pixel saturation gate then morph-close so the text strokes inside
     # the colored field (which sample the dark glyph colour, not the
-    # saturated fill) don't punch holes in the detected region.
-    seed = (chroma > chroma_lo).astype(np.uint8)
+    # saturated fill) don't punch holes in the detected region. Keep the
+    # raw (pre-close) seed alive too — it's the only signal that
+    # distinguishes "dark text on a solid coloured field" (raw seed dense
+    # within the closed bbox) from "saturated-coloured text on white
+    # paper" (raw seed = thin strokes, mostly white inside the closed
+    # bbox). Without that gate the routine over-fires on light gold
+    # decorative type and whitens the strokes themselves.
+    raw_seed = (chroma > chroma_lo).astype(np.uint8)
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (block, block))
-    seed = cv2.morphologyEx(seed, cv2.MORPH_CLOSE, k)
+    seed = cv2.morphologyEx(raw_seed, cv2.MORPH_CLOSE, k)
 
     n, labels, stats, _ = cv2.connectedComponentsWithStats(seed, 8)
     out = np.zeros((h, w), bool)
@@ -527,6 +535,24 @@ def preserve_text_mask(rgb: np.ndarray,
         frac = n_dark / n_comp
         if not (min_dark_frac <= frac <= max_dark_frac):
             continue
+        # Saturated-colour TEXT lookalike rejection. The component passed
+        # the dark-density gate with frac near zero — this can be (a) a
+        # solid decorative coloured accent on white (a chip, dot, stripe;
+        # whiten it cleanly, the channel can't render colour anyway), OR
+        # (b) the strokes of saturated-coloured TEXT on white paper (gold
+        # logo subhead, coloured caption, tinted disclaimer text). For
+        # case (b) the gold pixels themselves ARE the text and whitening
+        # them destroys the line. The discriminator is RAW chroma density
+        # inside the component's bounding box: a decorative accent fills
+        # the bbox with saturated pixels end-to-end (density > 0.55), a
+        # row of saturated-coloured glyphs leaves big paper-white gutters
+        # between strokes (density < ~0.30). Only the dense case is a
+        # genuine decorative accent we can erase safely.
+        if frac < 0.005:
+            raw_in_comp = raw_seed[y0:y0 + hh, x0:x0 + ww] & comp
+            chroma_density = float(raw_in_comp.sum()) / max(1, n_comp)
+            if chroma_density < solid_chroma_density:
+                continue
         # Whiten the entire bounding box (with a small outer pad to absorb
         # the very last fringe of anti-aliasing past the chroma seed),
         # MINUS the dark text strokes. The bbox approach is far more
@@ -1773,25 +1799,123 @@ TOP5_METHODS = COMPARE_METHODS
 # derived above from the SCREENS registry.
 
 
+def _extract_photo_features(gray: np.ndarray,
+                            mask: np.ndarray) -> dict:
+    """Compute cheap content stats over photo-mask pixels for `recommend_dither`.
+
+    Cost target: 10–30 ms per page. All ops are vectorised over the mask
+    pixels only, so cost scales with photo area rather than page area.
+
+    Returns an empty dict when the mask is too small to characterise
+    (fewer than ~1000 pixels) — the caller falls back to the legacy
+    photo-fraction-only logic in that case.
+
+    Features:
+      - mean_luma / std_luma                  0..255 stats on `gray[mask]`
+      - dark_fraction / light_fraction         shadows (<80) / highlights (>200)
+      - edge_density                           fraction of mask px with
+                                               |dx|+|dy| > 20 (8-bit Sobel-lite
+                                               via np.diff, no Sobel kernel)
+      - texture_score                          mean(|grad|) / std_luma — proxy
+                                               for fine-detail content (high =
+                                               fine texture, low = smooth)
+      - bimodal_score                          Otsu between-class variance
+                                               normalised by total variance,
+                                               0 = unimodal/smooth, 1 = perfectly
+                                               bimodal (text/poster-like)
+      - photo_area_px                          mask pixel count
+      - n_regions                              connected-components count (8-conn)
+    """
+    if gray is None or mask is None:
+        return {}
+    m = (mask > 0)
+    n = int(m.sum())
+    if n < 1000:
+        return {}
+
+    pix = gray[m].astype(np.float32)
+    mean_l = float(pix.mean())
+    std_l = float(pix.std())
+
+    dark_f = float((pix < 80).mean())
+    light_f = float((pix > 200).mean())
+
+    g16 = gray.astype(np.int16)
+    dx = np.zeros_like(g16)
+    dy = np.zeros_like(g16)
+    dx[:, 1:] = np.abs(g16[:, 1:] - g16[:, :-1])
+    dy[1:, :] = np.abs(g16[1:, :] - g16[:-1, :])
+    grad = (dx + dy).astype(np.uint16)
+    grad_in = grad[m]
+    edge_density = float((grad_in > 20).mean())
+    mean_grad = float(grad_in.mean())
+    texture_score = mean_grad / std_l if std_l > 1e-6 else 0.0
+
+    hist = np.bincount(pix.astype(np.uint8).ravel(), minlength=256).astype(np.float64)
+    total = hist.sum()
+    if total > 0 and std_l > 1e-6:
+        p = hist / total
+        idx = np.arange(256, dtype=np.float64)
+        cum_p = np.cumsum(p)
+        cum_mp = np.cumsum(idx * p)
+        mu_t = cum_mp[-1]
+        denom = cum_p * (1.0 - cum_p)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            sigma_b = np.where(denom > 1e-6,
+                               (mu_t * cum_p - cum_mp) ** 2 / denom,
+                               0.0)
+        var_total = float(std_l * std_l)
+        bimodal_score = float(np.max(sigma_b) / var_total) if var_total > 0 else 0.0
+        bimodal_score = max(0.0, min(1.0, bimodal_score))
+    else:
+        bimodal_score = 0.0
+
+    n_regions = 0
+    try:
+        nr, _lbl = cv2.connectedComponents(m.astype(np.uint8), 8)
+        n_regions = max(0, nr - 1)
+    except Exception:
+        n_regions = 0
+
+    return {
+        "mean_luma": round(mean_l, 1),
+        "std_luma": round(std_l, 1),
+        "dark_fraction": round(dark_f, 3),
+        "light_fraction": round(light_f, 3),
+        "edge_density": round(edge_density, 3),
+        "texture_score": round(texture_score, 2),
+        "bimodal_score": round(bimodal_score, 3),
+        "photo_area_px": int(n),
+        "n_regions": int(n_regions),
+    }
+
+
 def recommend_dither(photo_fraction: float, fax_heavy: bool,
-                     vdpi: int = 196) -> tuple:
+                     vdpi: int = 196, *,
+                     features: dict | None = None) -> tuple:
     """Suggest the OPTIMAL halftone for this page; returns (method, reason).
 
-    Below ~150 DPI render the page can't carry an AM/clustered screen at a
-    reasonable line-per-inch pitch — the cell would have to be 2 px to hit
-    50 lpi at 100 DPI, which has only 4 tone levels (so photos plug to mud).
-    For low-DPI rasters we recommend `blue-noise` instead: an isotropic FM
-    stipple whose dot pitch is one pixel, so the screen looks fine even at
-    96 DPI native.
+    Decision tree, in priority order:
 
-    Once we clear the low-DPI band, `green-noise` is the default for any page
-    with photo content: it keeps blue-noise-level detail in continuous-tone
-    regions (a fine-detail photo at 300 PPI through a 9-px clustered cell
-    pitches the screen at a newsprint-coarse ~33 LPI and plugs all the
-    fine structure), while still clustering dots into runs long enough to
-    survive a real line. Pure `clustered` is reserved for `--fax-heavy`,
-    where the user has explicitly opted into maximum compression and
-    line-noise robustness over rendered detail."""
+      1. Page is essentially text/line art          -> none
+      2. Low-DPI raster source (vdpi < 150)         -> blue-noise
+      3. --fax-heavy mode                            -> clustered
+
+    Below this, when feature stats are available, the picker discriminates
+    within the detail-preserving family ({floyd, jarvis, edd, green-noise})
+    plus the two high-contrast specialists ({clustered, atkinson}):
+
+      4. Bimodal poster/signage (clean text + flat fields)   -> clustered
+      5. Dark high-contrast photo (shadows + wide tonal std) -> atkinson
+      6. Text-on-photo / strong edges at mid luma            -> edd
+      7. Fine-detail texture (high mean-grad / std ratio)    -> floyd
+      8. Smooth gradient (low std, low edges)                -> jarvis
+      9. Mixed-content photo (no strong signal)              -> green-noise
+
+    `recommend_dither` is signature-stable: callers that don't pass
+    `features` get the legacy 4-branch behaviour and green-noise as the
+    default for photo pages.
+    """
     if photo_fraction < 0.03:
         return "none", ("Page is essentially text / line art (photo area "
                         f"{photo_fraction * 100:.0f}%); a hard threshold is the "
@@ -1807,6 +1931,71 @@ def recommend_dither(photo_fraction: float, fax_heavy: bool,
                              "it compresses best and survives a noisy line — at "
                              "the cost of a visibly coarse screen on fine photo "
                              "detail.")
+
+    f = features or {}
+    if f:
+        mean_l = float(f.get("mean_luma", 128.0))
+        std_l = float(f.get("std_luma", 0.0))
+        edge_d = float(f.get("edge_density", 0.0))
+        tex = float(f.get("texture_score", 0.0))
+        bimod = float(f.get("bimodal_score", 0.0))
+        dark_f = float(f.get("dark_fraction", 0.0))
+        light_f = float(f.get("light_fraction", 0.0))
+        polarity = dark_f + light_f
+
+        # 4. True bimodal poster / signage: Otsu separability is high, the
+        # tone histogram is dominated by shadows + highlights (low mid-tone
+        # mass), and the interior is low-edge (sparse strokes, not text
+        # overlaid on a photo). All three gates are required so this branch
+        # only fires on genuine 2-tone artwork, not photos with strong
+        # foreground/background separation.
+        if (bimod > 0.70 and std_l > 70.0
+                and polarity > 0.80 and edge_d < 0.12):
+            return "clustered", (
+                f"Bimodal poster/signage content (bimodality {bimod:.2f}, "
+                f"std luma {std_l:.0f}, polarity {polarity:.2f}): clustered-"
+                "dot resolves the two flat fields cleanly and compresses best, "
+                "where an FM screen would add visible texture to areas the "
+                "source treats as solid.")
+
+        if mean_l < 85.0 and std_l > 50.0:
+            return "atkinson", (
+                f"Dark high-contrast photo (mean luma {mean_l:.0f}, "
+                f"std luma {std_l:.0f}): Atkinson ED preserves thin whites and "
+                "sparkle in deep shadows where green-noise plugs to mud and "
+                "Floyd over-darkens.")
+
+        # 6. Text-on-photo / strong-edge content: an edge-density gate at
+        # ~15 % of the photo area picks up signage and overlay type sitting
+        # on photographic backdrops (e.g., the Prestige cover billboard).
+        if edge_d > 0.15 and 85.0 <= mean_l <= 200.0:
+            return "edd", (
+                f"Text-on-photo / strong-edge content (edge density "
+                f"{edge_d * 100:.0f}%, mean luma {mean_l:.0f}): EDD's "
+                "edge-enhancing diffusion keeps fine type readable against the "
+                "photo backdrop better than any AM/FM screen.")
+
+        if tex > 1.50:
+            return "floyd", (
+                f"Fine-detail texture (texture score {tex:.2f}): classic "
+                "Floyd–Steinberg ED carries the highest fidelity for "
+                "continuous-tone fine grain, at the cost of a chattier line "
+                "than green-noise on a noisy channel.")
+
+        if std_l < 30.0 and edge_d < 0.08:
+            return "jarvis", (
+                f"Smooth gradient (std luma {std_l:.0f}, edge density "
+                f"{edge_d * 100:.0f}%): Jarvis–Judice–Ninke ED diffuses the "
+                "tone the smoothest, so banding in skies / skin / paper "
+                "gradients is softer than Floyd's tighter weights.")
+
+        return "green-noise", (
+            f"Mixed-content photo (mean luma {mean_l:.0f}, std luma "
+            f"{std_l:.0f}, edge density {edge_d * 100:.0f}%, texture "
+            f"{tex:.2f}): green-noise hybrid keeps blue-noise-level detail in "
+            "continuous-tone regions while clustering dots into longer runs, "
+            "the best balance when no single signal dominates.")
+
     return "green-noise", (f"Photo area {photo_fraction * 100:.0f}%: green-noise "
                            "hybrid keeps blue-noise-level detail in continuous-"
                            "tone regions while clustering dots into longer runs, "
@@ -1817,10 +2006,12 @@ def recommend_dither(photo_fraction: float, fax_heavy: bool,
 
 
 def choose_dither(name: str, fax_heavy: bool, photo_fraction: float,
-                  vdpi: int = 196) -> str:
+                  vdpi: int = 196, *,
+                  features: dict | None = None) -> str:
     if name and name != "auto":
         return DITHER_ALIASES.get(name, name)
-    return recommend_dither(photo_fraction, fax_heavy, vdpi)[0]
+    return recommend_dither(photo_fraction, fax_heavy, vdpi,
+                            features=features)[0]
 
 
 def halftone(gray: np.ndarray, name: str, hdpi: int, vdpi: int,
@@ -2127,8 +2318,9 @@ def _prepare_page(page: fitz.Page, opt: FaxOptions):
 
     mask = photo
     photo_fraction = float(mask.mean()) if mask.size else 0.0
+    features = _extract_photo_features(gray, mask) if photo_fraction > 0 else {}
     return (gray, mask, photo_fraction, warnings, False, doc_info, image_info,
-            text_black, text_white, eff_dpi)
+            text_black, text_white, eff_dpi, features)
 
 
 def _apply_dither(gray, mask, dither_name, opt, hdpi, vdpi,
@@ -2253,10 +2445,11 @@ def process_page(page: fitz.Page, idx: int, opt: FaxOptions) -> tuple[Image.Imag
         rep.photo_fraction = 0.0
         return _finalize_basic(bw, opt), rep
     (gray, mask, photo_fraction, warnings, already, doc_info, image_info,
-     text_black, text_white, eff_dpi) = _prepare_page(page, opt)
+     text_black, text_white, eff_dpi, photo_features) = _prepare_page(page, opt)
     rep.warnings.extend(warnings)
     rep.photo_fraction = round(photo_fraction, 4)
     rep.text_binarize = opt.text_binarize
+    rep.photo_features = photo_features
     if image_info.get("words"):
         rep.recover_text = image_info
     if doc_info.get("words"):
@@ -2268,7 +2461,8 @@ def process_page(page: fitz.Page, idx: int, opt: FaxOptions) -> tuple[Image.Imag
         return _finalize(threshold_otsu(gray), rep, opt), rep
 
     rep.photo_regions = int(mask.any())
-    dname = choose_dither(opt.dither, opt.fax_heavy, photo_fraction, eff_dpi)
+    dname = choose_dither(opt.dither, opt.fax_heavy, photo_fraction, eff_dpi,
+                          features=photo_features)
     rep.dither = dname
     rep.warnings.extend(_screen_choice_warnings(dname, opt))
     bw = _apply_dither(gray, mask, dname, opt, eff_dpi, eff_dpi,
@@ -2437,8 +2631,148 @@ def _save_multipage_tiff(tiff_paths, out_path):
     first.save(out_path, **kw)
 
 
+# --------------------------------------------------------------------------- #
+# Unified contact-sheet ("--sample") infrastructure                           #
+# --------------------------------------------------------------------------- #
+#
+# `render_contact_sheet()` is the single entry point for every per-page panel
+# comparison the skill emits. It supersedes the previously separate
+# `render_sample` (4-panel pipeline-stages view), `render_comparison`
+# (6-up dither comparison), `render_preview` (1-panel), and
+# `render_recover_text_preview` (2-panel before/after) functions; those remain
+# as thin shims for backward compatibility with existing callers and CLI flags.
+#
+# The function takes one knob — `panel_count` — that selects from PANEL_RECIPES
+# below, where each recipe is a list of CONTENT KEYS describing what goes in
+# each cell. Content keys come in five flavours:
+#
+#   - "orig"          → the source page in colour (no fax processing)
+#   - "gray"          → the source page desaturated (no fax processing)
+#   - "default_fax"   → `--basic` mode (grayscale + Otsu, no MRC / OCR /
+#                       halftone) — the "naive fax" baseline
+#   - "optimized"     → the user's full options as passed in
+#   - "recommended"   → the user's options BUT with dither replaced by the
+#                       auto-picker's recommendation (so a 2-up of orig +
+#                       recommended is always "what Claude would pick")
+#   - "<dither>"      → the user's options with dither overridden. Plain
+#                       names ("floyd", "blue-noise", etc.) map to the
+#                       matching SCREENS entry; parametric aliases
+#                       "screen-square", "screen-diamond", "screen-ellipse"
+#                       map to dither="screen" + the corresponding dot_shape.
+#
+# Canonical ordered catalogue of every dither key the user-facing contact
+# sheet exposes. Matches the SCREENS registry but adds the three parametric
+# `screen` variants (square / diamond / ellipse dot) as discrete keys so
+# they appear as individual panels in the 20-up sheet and in the
+# README halftone gallery. This is the SINGLE SOURCE OF TRUTH — both
+# `PANEL_RECIPES[20]` below AND `_run_readme_demo.py:build_halftone_grid`
+# read this list, so adding a new screen here automatically lights it up
+# everywhere.
+ALL_HALFTONE_KEYS: list[str] = [
+    "none", "clustered",
+    "screen-square", "screen-diamond", "screen-ellipse",
+    "ordered", "blue-noise", "green-noise",
+    "floyd", "atkinson", "jarvis", "stucki", "sierra", "edd",
+    "line", "crosshatch", "mezzotint",
+]
+
+# PANEL_RECIPES is monotonic by design: each higher panel-count is a strict
+# superset of the elements you'd see at the lower counts, so the user's choice
+# of `--panels K` is a clean detail dial. The 20-up mirrors
+# `ALL_HALFTONE_KEYS` above, so a user running `--sample 1 --panels max`
+# gets the same "every screen in the registry" sheet that the README
+# `halftone_grid.png` showcases.
+PANEL_RECIPES: dict[int, list[str]] = {
+    1:  ["optimized"],
+    2:  ["orig", "recommended"],
+    4:  ["orig", "gray", "default_fax", "recommended"],
+    6:  ["orig", "gray", "default_fax", "recommended",
+         "green-noise", "floyd"],
+    8:  ["orig", "gray", "default_fax", "recommended",
+         "clustered", "blue-noise", "atkinson", "line"],
+    12: ["orig", "gray", "default_fax", "recommended",
+         "clustered", "screen-diamond", "ordered", "blue-noise",
+         "green-noise", "floyd", "edd", "line"],
+    20: ["orig", "gray", "default_fax"] + ALL_HALFTONE_KEYS,
+}
+
+# Display labels for content keys. Anything not listed here falls back to a
+# Title-cased dither name (so a brand-new screen added to SCREENS automatically
+# gets a sensible default label).
+_PANEL_LABELS: dict[str, str] = {
+    "orig":            "ORIGINAL (color)",
+    "gray":            "TRUE GRAYSCALE",
+    "default_fax":     "DEFAULT FAX (Otsu)",
+    "optimized":       "OPTIMIZED FAX OUTPUT",
+    "recommended":     "RECOMMENDED (auto-pick)",
+    # Recover-text comparison pair: same options, recover-text forced
+    # off / on so the two panels isolate ONLY that pass's effect.
+    "no_recover":      "WITHOUT recover-text",
+    "with_recover":    "WITH recover-text",
+    "screen-square":   "Screen \u2014 square dot",
+    "screen-diamond":  "Screen \u2014 diamond dot",
+    "screen-ellipse":  "Screen \u2014 ellipse dot",
+    "none":            "Hard threshold",
+    "green-noise":     "Green noise (AM-FM)",
+    "blue-noise":      "Blue noise (FM)",
+    "ordered":         "Ordered / Bayer",
+    "floyd":           "Floyd-Steinberg",
+    "atkinson":        "Atkinson",
+    "jarvis":          "Jarvis-Judice-Ninke",
+    "stucki":          "Stucki",
+    "sierra":          "Sierra",
+    "edd":             "Edge-enhancing ED",
+    "line":            "Line / woodcut",
+    "crosshatch":      "Crosshatch (0\u00b0,90\u00b0)",
+    "clustered":       "Clustered-dot (AM)",
+    "mezzotint":       "Mezzotint (grain)",
+}
+
+
+def _panel_label(key: str) -> str:
+    return _PANEL_LABELS.get(key, key.replace("-", " ").title())
+
+
+def _resolve_panel_opt(key: str, base_opt: "FaxOptions",
+                       recommended_dither: str) -> "FaxOptions | None":
+    """Map a panel content key to a FaxOptions instance for rendering.
+
+    Returns None for non-fax reference panels ("orig" / "gray") since those
+    are rendered from the source PDF directly without going through the
+    bilevel pipeline.
+    """
+    import dataclasses
+    if key in ("orig", "gray"):
+        return None
+    if key == "default_fax":
+        return dataclasses.replace(base_opt, basic=True)
+    if key == "optimized":
+        return base_opt
+    if key == "recommended":
+        return dataclasses.replace(base_opt, dither=recommended_dither)
+    if key == "no_recover":
+        return dataclasses.replace(base_opt, recover_text="off")
+    if key == "with_recover":
+        return dataclasses.replace(base_opt, recover_text="on")
+    if key == "screen-square":
+        return dataclasses.replace(base_opt, dither="screen",
+                                   dot_shape="square")
+    if key == "screen-diamond":
+        return dataclasses.replace(base_opt, dither="screen",
+                                   dot_shape="diamond")
+    if key == "screen-ellipse":
+        return dataclasses.replace(base_opt, dither="screen",
+                                   dot_shape="ellipse")
+    return dataclasses.replace(base_opt, dither=key)
+
+
 def render_preview(in_pdf: str, page_no: int, out_png: str, opt: FaxOptions):
-    """Render exactly the bilevel output for one page as a PNG, for inspection."""
+    """Render exactly the bilevel output for one page as a bare grayscale
+    PNG — no labels, no borders, no settings header. This is the underlying
+    "bare image" primitive used for pixel-level inspection / overlay; the
+    labeled-grid variant lives in `render_contact_sheet`. Keeping this as a
+    standalone four-line function deliberately (it's not redundant with the
+    labeled-grid path — it has a different output contract)."""
     doc = fitz.open(in_pdf)
     page = doc[page_no - 1]
     img, _ = process_page(page, page_no, opt)
@@ -2448,88 +2782,252 @@ def render_preview(in_pdf: str, page_no: int, out_png: str, opt: FaxOptions):
 
 def render_recover_text_preview(in_pdf: str, page_no: int, out_png: str,
                                opt: FaxOptions) -> dict:
-    """Side-by-side proof that recover-text helped: the exact bilevel page as
-    it would fax WITHOUT the within-image OCR recolor (left) vs WITH it (right).
-    Document-text OCR (outside images) stays on for both panels — only the
-    within-image recover-text pass is toggled, so the comparison isolates that
-    effect. Returns the recognised words and their polarity decisions."""
-    import dataclasses
-    off = dataclasses.replace(opt, recover_text="off")
-    before, _ = process_page(fitz.open(in_pdf)[page_no - 1], page_no, off)
-    after, rep = process_page(fitz.open(in_pdf)[page_no - 1], page_no, opt)
-    rt = rep.recover_text or {}
-    nblack = rt.get("words_recolored_black", 0)
-    nwhite = rt.get("words_recolored_white", 0)
-    metrics = {
-        "before": {"original": True, "label": "WITHOUT recover text",
-                   "note": "colored/low-contrast image text as a plain fax"},
-        "after": {"original": True, "label": "WITH recover text",
-                  "note": (f"{nblack} black + {nwhite} white word(s) recolored "
-                           "by the #808080 rule")},
-    }
-    _compose_contact_sheet([("before", before), ("after", after)],
-                           metrics, recommended="after").save(out_png)
+    """[LEGACY] Side-by-side proof that recover-text helped: bilevel page
+    as it would fax WITHOUT the within-image OCR recolor (left) vs WITH
+    it (right). Document-text OCR (outside images) stays on for both
+    panels — only the within-image recover-text pass is toggled.
+
+    Now a thin shim over `render_contact_sheet`. New code should call
+    `render_contact_sheet(in_pdf, page_no, out_png, opt,
+                          include=["no_recover", "with_recover"])`
+    directly; this wrapper exists so existing imports keep working.
+    Returns the same dict shape as before (with a `recover_text` field
+    populated from the WITH panel)."""
+    result = render_contact_sheet(
+        in_pdf, page_no, out_png, opt,
+        include=["no_recover", "with_recover"])
+    rt = result.get("panels", {}).get("with_recover", {}).get(
+        "recover_text", {}) or {}
     return {"page": page_no, "output": out_png, "recover_text": rt}
 
 
 def render_sample(in_pdf: str, page_no: int, out_png: str,
                   opt: FaxOptions) -> dict:
-    """Write a four-panel sample sheet showing exactly what the pipeline does:
+    """[LEGACY] Write the default 4-panel sample sheet for one page.
 
-    a) ORIGINAL — the source page in colour, untouched.
-    b) GRAYSCALE — the same page desaturated, no other processing. This is the
-       continuous-tone input the 1-bit channel has to approximate.
-    c) HALFTONE ONLY — bilevel page with halftoning on image areas, document
-       text crisp via the binarizer, but no within-image recover-text recolor
-       (so signage stays as the channel sees it). Document-text OCR is still on
-       so headers/footers carry their #808080 polarity.
-    d) HALFTONE + RECOVER TEXT — the full pipeline, with within-image words
-       recoloured BLACK/WHITE per the #808080 rule and composited above the
-       halftoned image layer.
+    Now a thin shim over `render_contact_sheet(panel_count=4)`. New code
+    should call `render_contact_sheet` directly to pick a panel count.
 
-    Panel c) reflects the user's options with recover-text forced OFF; panel d)
-    forces recover-text ON. The sheet's whole point is to show what recover-
-    text does, so it's wired into d) regardless of the user's default — the
-    *opt-in* is for the actual conversion, not for the diagnostic sample."""
+    Note: the panel CONTENT changed in this revamp — the old 4-panel was
+    a "pipeline-stages" view (orig / gray / halftone-only / halftone+
+    recover-text), the new 4-panel is a comparison view (orig / gray /
+    DEFAULT FAX Otsu / RECOMMENDED auto-pick). The old stages comparison
+    is still reachable via `render_contact_sheet(include=["orig", "gray",
+    "no_recover", "with_recover"])` (or the legacy `render_recover_text_
+    preview` for just the recover-text isolation).
+    """
+    return render_contact_sheet(in_pdf, page_no, out_png, opt,
+                                panel_count=4)
+
+
+def render_contact_sheet(in_pdf: str, page_no: int, out_png: str,
+                         opt: FaxOptions, *,
+                         panel_count: int = 4,
+                         include: list[str] | None = None,
+                         show_header: bool = True) -> dict:
+    """Render a one-page-of-PDF contact sheet with N panels for inspection.
+
+    This is the single entry point for the skill's per-page panel comparison
+    output. The cell content is selected by `panel_count` (default 4) from
+    PANEL_RECIPES — see the comment above PANEL_RECIPES for the per-count
+    progression — or fully specified by `include` for power users
+    (e.g. `include=["orig", "gray", "clustered", "floyd"]`).
+
+    panel_count must be a key of PANEL_RECIPES (1, 2, 4, 6, 8, 12, or 20).
+    The default 4-panel is: ORIGINAL + GRAYSCALE + DEFAULT FAX (Otsu) +
+    RECOMMENDED (auto-pick). `--panels 20` ("max") renders every screen in
+    the SCREENS registry against the user's own document, equivalent to
+    `docs/readme/halftone_grid.png` applied to their input.
+
+    `show_header` adds a 3-line settings header above the grid showing the
+    actual run options (preserve_text, ocr_text, recover_text, etc.) plus
+    the auto-pick recommendation and reason, so the saved sheet is
+    self-documenting weeks later.
+
+    Returns a dict with: page number, output path, per-panel metrics
+    (encoded_bytes, est_transmission_s), the auto-recommended dither + reason,
+    and the smallest-by-G4-size dither (for cost-conscious users)."""
     import dataclasses
+
+    if include is not None:
+        recipe = list(include)
+    elif panel_count in PANEL_RECIPES:
+        recipe = list(PANEL_RECIPES[panel_count])
+    else:
+        valid = sorted(PANEL_RECIPES.keys())
+        raise ValueError(
+            f"panel_count={panel_count} not in {valid} — "
+            "pass include=[...] for a custom recipe instead")
+
     doc = fitz.open(in_pdf)
     page = doc[page_no - 1]
     hdpi, vdpi = RESOLUTIONS[opt.resolution]
-    color = render_page_color(page, hdpi, vdpi, opt.max_scanline_px)
-    gray_ref = render_page_gray(page, hdpi, vdpi, opt.max_scanline_px)
 
-    no_recover = dataclasses.replace(opt, recover_text="off")
-    with_recover = dataclasses.replace(opt, recover_text="on")
-    halftone_img, ht_rep = process_page(page, page_no, no_recover)
-    full_img, full_rep = process_page(page, page_no, with_recover)
+    # Reference panels rendered directly from the source PDF.
+    color_arr = gray_arr = None
+    if "orig" in recipe:
+        color_arr = render_page_color(page, hdpi, vdpi, opt.max_scanline_px)
+    if "gray" in recipe:
+        gray_arr = render_page_gray(page, hdpi, vdpi, opt.max_scanline_px)
 
-    rt = full_rep.recover_text or {}
-    di = full_rep.ocr_text or {}
-    nblack = rt.get("words_recolored_black", 0)
-    nwhite = rt.get("words_recolored_white", 0)
-    docw = len(di.get("words", []))
+    # Any fax panel — including "default_fax" — needs eff_dpi + photo_fraction
+    # for the per-panel cost estimate and the auto-pick recommendation. Run
+    # `_prepare_page` once with the user's opt and reuse the prepared state
+    # for every per-dither variation. Avoids paying the OCR cost N times.
+    needs_prepared = any(
+        k not in ("orig", "gray", "default_fax") for k in recipe)
+    needs_anyfax = needs_prepared or "default_fax" in recipe
+    prepared = photo_fraction = eff_dpi = None
+    photo_features: dict = {}
+    rec_dither = rec_reason = None
+    if needs_prepared:
+        prepared = _prepare_page(page, opt)
+        photo_fraction = prepared[2]
+        eff_dpi = prepared[9]
+        photo_features = prepared[10] or {}
+    elif needs_anyfax:
+        # Only default_fax (basic) is requested — still need eff_dpi for the
+        # cost estimate; photo_fraction stays 0 because basic skips MRC.
+        eff_dpi = _page_effective_dpi(page, opt)
+        photo_fraction = 0.0
+    if needs_anyfax:
+        rec_dither, rec_reason = recommend_dither(
+            photo_fraction or 0.0, opt.fax_heavy, eff_dpi,
+            features=photo_features)
 
-    panels = [
-        ("original", Image.fromarray(color, "RGB")),
-        ("grayscale", Image.fromarray(gray_ref).convert("L")),
-        ("halftone", halftone_img),
-        ("recover", full_img),
-    ]
-    metrics = {
-        "original":  {"original": True, "label": "a) ORIGINAL (color)",
-                      "note": "source page \u00b7 not a fax"},
-        "grayscale": {"original": True, "label": "b) GRAYSCALE",
-                      "note": "desaturated source \u00b7 not a fax"},
-        "halftone":  {"original": True, "label": "c) HALFTONE on image areas",
-                      "note": (f"document text crisp ({docw} word(s) by "
-                               "#808080); recover-text OFF \u00b7 fax preview")},
-        "recover":   {"original": True, "label": "d) HALFTONE + RECOVER TEXT",
-                      "note": (f"image text recoloured: {nblack} black + "
-                               f"{nwhite} white \u00b7 fax preview")},
+    tmpdir = tempfile.mkdtemp(prefix="faxsheet_")
+    panels: list = []
+    metrics: dict = {}
+
+    def _add_fax_panel(key: str, bw_img: Image.Image, label: str,
+                       dither_name: str | None = None):
+        tp = os.path.join(tmpdir, f"{key}.tif")
+        nbytes = encode_g4_tiff(bw_img, tp)
+        est_s = round(
+            nbytes * 8 / opt.line_rate_bps + opt.page_overhead_s, 1)
+        panels.append((key, bw_img))
+        metrics[key] = {
+            "encoded_bytes": nbytes,
+            "est_transmission_s": est_s,
+            "label": label,
+            "dither": dither_name,
+        }
+
+    for key in recipe:
+        if key == "orig":
+            panels.append(("orig", Image.fromarray(color_arr, "RGB")))
+            metrics["orig"] = {
+                "encoded_bytes": 0, "est_transmission_s": 0.0,
+                "original": True, "label": _panel_label("orig"),
+                "note": "color source \u00b7 not a fax",
+            }
+            continue
+        if key == "gray":
+            panels.append(("gray", Image.fromarray(gray_arr).convert("L")))
+            metrics["gray"] = {
+                "encoded_bytes": 0, "est_transmission_s": 0.0,
+                "original": True, "label": _panel_label("gray"),
+                "note": "grayscale source \u00b7 not a fax",
+            }
+            continue
+        if key == "default_fax":
+            # Basic mode: grayscale + Otsu, no MRC / OCR / halftone. This
+            # is the "naive fax" baseline that the rest of the pipeline
+            # improves on, and the visual anchor against which the user
+            # decides whether the optimizations are worth the bytes.
+            basic_opt = dataclasses.replace(opt, basic=True)
+            basic_dpi = _page_effective_dpi(page, basic_opt)
+            basic_gray = render_page_gray(
+                page, basic_dpi, basic_dpi, basic_opt.max_scanline_px)
+            bw = threshold_otsu(basic_gray)
+            bw_img = _finalize_basic(bw, basic_opt)
+            _add_fax_panel("default_fax", bw_img,
+                           _panel_label("default_fax"), dither_name="none")
+            continue
+
+        if key in ("no_recover", "with_recover"):
+            # The recover-text on/off comparison changes _prepare_page's
+            # OCR-driven text masks, so it can't share the cached `prepared`
+            # state with the other dither variations — it needs its own
+            # full pipeline run. This is the legacy --recover-text-preview
+            # behaviour, now folded into the unified path. Capture the
+            # PageReport so the caller can pull recover_text statistics
+            # (number of words recoloured, polarity decisions) for the
+            # legacy `render_recover_text_preview` return shape.
+            panel_opt = _resolve_panel_opt(key, opt, rec_dither or "clustered")
+            bw_img, rep = process_page(page, page_no, panel_opt)
+            _add_fax_panel(key, bw_img, _panel_label(key),
+                           dither_name=panel_opt.dither)
+            if rep.recover_text:
+                metrics[key]["recover_text"] = rep.recover_text
+            if rep.ocr_text:
+                metrics[key]["ocr_text"] = rep.ocr_text
+            continue
+
+        # Everything else is a pipeline panel that reuses the prepared state.
+        panel_opt = _resolve_panel_opt(key, opt, rec_dither or "clustered")
+        (gray, mask, _pf, _w, _alr, _di, _ii,
+         text_black, text_white, _eff, _pf_feat) = prepared
+        if key == "optimized":
+            d_name = choose_dither(panel_opt.dither, panel_opt.fax_heavy,
+                                   photo_fraction, eff_dpi,
+                                   features=photo_features)
+        elif key == "recommended":
+            d_name = rec_dither
+        else:
+            d_name = panel_opt.dither
+        bw = _apply_dither(gray, mask, d_name, panel_opt,
+                           eff_dpi, eff_dpi,
+                           text_black=text_black, text_white=text_white)
+        rep = PageReport(index=page_no)
+        rep.dither = d_name
+        bw_img = _finalize(bw.astype(np.uint8), rep, panel_opt, protect=mask)
+        _add_fax_panel(key, bw_img, _panel_label(key), dither_name=d_name)
+
+    # Pick the recommended panel for the green highlight. Prefer the
+    # explicit "recommended" key (auto-pick) when the recipe carries it;
+    # otherwise the panel whose dither matches rec_dither; otherwise the
+    # smallest-by-G4-size fax panel; otherwise None.
+    #
+    # A "RECOMMENDED" badge only makes sense on a sheet with multiple fax
+    # options to compare; on a single-panel sheet (`--panels 1`) it's
+    # noise — the lone panel IS the output by definition. Skip the
+    # highlight in that case.
+    fax_panels = {k: m for k, m in metrics.items()
+                  if not m.get("original")}
+    recommended_key = None
+    if len(fax_panels) >= 2:
+        if "recommended" in metrics:
+            recommended_key = "recommended"
+        elif rec_dither is not None:
+            for k, m in metrics.items():
+                if m.get("dither") == rec_dither and not m.get("original"):
+                    recommended_key = k
+                    break
+        if recommended_key is None and fax_panels:
+            recommended_key = min(
+                fax_panels, key=lambda k: fax_panels[k]["encoded_bytes"])
+
+    header_img = None
+    if show_header:
+        header_img = _render_settings_header(
+            in_pdf, page_no, opt, photo_fraction or 0.0, eff_dpi,
+            rec_dither, rec_reason, panel_count=len(panels))
+
+    sheet = _compose_contact_sheet(panels, metrics, recommended_key,
+                                   header=header_img)
+    sheet.save(out_png)
+    return {
+        "page": page_no,
+        "output": out_png,
+        "panel_count": len(panels),
+        "panels": metrics,
+        "recommended": rec_dither,
+        "reason": rec_reason,
+        "smallest": (min(
+            (k for k, m in metrics.items() if not m.get("original")),
+            key=lambda k: metrics[k]["encoded_bytes"], default=None)),
     }
-    _compose_contact_sheet(panels, metrics, recommended="recover").save(out_png)
-    return {"page": page_no, "output": out_png,
-            "doc_text": di, "recover_text": rt}
 
 
 # --------------------------------------------------------------------------- #
@@ -2570,6 +3068,89 @@ def _oswald_font(size: int, weight: str = "Bold"):
         except Exception:
             continue
     return _load_font(size)
+
+
+def _render_settings_header(in_pdf: str, page_no: int, opt: FaxOptions,
+                            photo_fraction: float, eff_dpi: int | None,
+                            rec_dither: str | None,
+                            rec_reason: str | None,
+                            panel_count: int = 4,
+                            width: int = 1920) -> Image.Image:
+    """Build the 3-line settings strip rendered above the panel grid.
+
+    Self-documents the contact sheet: line 1 says what the source was,
+    line 2 lists the layered text/legibility passes the user enabled,
+    line 3 lists the channel knobs + the auto-pick recommendation. The
+    strip is rendered at `width` and then resized to match the panel
+    grid's width by the compositor.
+    """
+    from PIL import ImageDraw
+
+    pad = 22
+    line1_h, line2_h, line3_h = 30, 22, 22
+    gap_after_line1 = 10
+    H = pad + line1_h + gap_after_line1 + line2_h + 6 + line3_h + pad
+    img = Image.new("RGB", (width, H), (244, 244, 244))
+    d = ImageDraw.Draw(img)
+    d.rectangle([0, H - 2, width - 1, H - 1], fill=(220, 220, 220))
+
+    f1 = _oswald_font(26, "SemiBold")
+    f2 = _load_font(15)
+    f3 = _load_font(15)
+
+    src = os.path.basename(in_pdf) if in_pdf else "(unknown)"
+    res_label = (f"{opt.resolution} ({eff_dpi} DPI)"
+                 if eff_dpi else opt.resolution)
+    title = (f"{src}  \u00b7  page {page_no}  \u00b7  {res_label}  "
+             f"\u00b7  {panel_count} panel{'s' if panel_count != 1 else ''}")
+    d.text((pad, pad), title, font=f1, fill=(20, 20, 20))
+
+    # Layered text + legibility passes. `auto` shows the resolved
+    # behaviour for ocr_text / recover_text since their default is auto.
+    def _onoff(v) -> str:
+        if isinstance(v, bool):
+            return "on" if v else "off"
+        return str(v)
+    line2_parts = [
+        f"preserve_text={_onoff(opt.preserve_text)}",
+        f"ocr_text={_onoff(opt.ocr_text)}",
+        f"recover_text={_onoff(opt.recover_text)}",
+        f"text_binarize={opt.text_binarize}",
+    ]
+    if opt.basic:
+        line2_parts = ["basic mode (Otsu, no MRC/OCR/halftone)"]
+    line2 = "   \u00b7   ".join(line2_parts)
+    d.text((pad, pad + line1_h + gap_after_line1), line2,
+           font=f2, fill=(60, 60, 60))
+
+    line3_parts = [f"dither={opt.dither}"]
+    if opt.fax_heavy:
+        line3_parts.append("fax-heavy=on")
+    if opt.transmission_safe:
+        line3_parts.append("transmission_safe=on (\u22641728 px scanline)")
+    if rec_dither and opt.dither == "auto":
+        # Surface auto-pick + a SHORT descriptor. The full multi-sentence
+        # reason from `recommend_dither()` is too long for the header; pull
+        # the first clause (up to the em-dash) out of HALFTONE_INFO so the
+        # header reads "auto -> green-noise (Green-noise hybrid AM-FM)".
+        short = HALFTONE_INFO.get(rec_dither, "")
+        short = short.split(" \u2014 ", 1)[0].strip().rstrip(".,")
+        if short:
+            line3_parts.append(f"auto\u2192{rec_dither} ({short})")
+        else:
+            line3_parts.append(f"auto\u2192{rec_dither}")
+    if photo_fraction:
+        line3_parts.append(f"photo_fraction={photo_fraction:.2f}")
+    line3 = "   \u00b7   ".join(line3_parts)
+    # Truncate gracefully if line3 still doesn't fit; pop the optional
+    # trailing parts (photo_fraction, auto-pick descriptor) before falling
+    # back to bare config keys + an ellipsis.
+    while line3_parts and f3.getbbox(line3)[2] > width - 2 * pad:
+        line3_parts.pop()
+        line3 = "   \u00b7   ".join(line3_parts) + " \u2026"
+    d.text((pad, pad + line1_h + gap_after_line1 + line2_h + 6), line3,
+           font=f3, fill=(60, 60, 60))
+    return img
 
 
 _WRAP_BREAK_CHARS = ";:,."           # word-final clause punctuation
@@ -2661,9 +3242,14 @@ def _wrap_text(text: str, font, max_w: int, max_lines: int = 2) -> list[str]:
     return lines
 
 
-def _compose_contact_sheet(panels, metrics, recommended, cell_w=480):
+def _compose_contact_sheet(panels, metrics, recommended, cell_w=480,
+                           header: "Image.Image | None" = None):
     """panels: list of (method_name, PIL '1' image). Returns an RGB contact
-    sheet with a labeled, metric-annotated panel per method."""
+    sheet with a labeled, metric-annotated panel per method.
+
+    If `header` is provided, it is composited as a strip ABOVE the panel
+    grid (full canvas width; height taken from the supplied image). Use
+    `_render_settings_header()` to build a standard run-options strip."""
     from PIL import ImageDraw
     rendered = []
     for name, img in panels:
@@ -2686,12 +3272,36 @@ def _compose_contact_sheet(panels, metrics, recommended, cell_w=480):
     note_line_h = 19                           # tight subheading leading
     cap = note_top + 2 * note_line_h + 6       # 85 px header band
     pad, title_h = 18, 18
-    cols = 3 if len(rendered) > 4 else max(1, len(rendered))
-    rows = (len(rendered) + cols - 1) // cols
+    # Grid layout: up to 4 panels in a single row; 5–6 panels go to 3 cols
+    # (matches the original `--compare-page` 2×3); 7+ panels (the 8/12/20
+    # contact sheets) need a 4-col layout so the rendered cells don't get
+    # gigantic and aspect-correct images still fit.
+    n = len(rendered)
+    if n <= 4:
+        cols = max(1, n)
+    elif n <= 6:
+        cols = 3
+    else:
+        cols = 4
+    rows = (n + cols - 1) // cols
     cell_h = max(r.height for _, r in rendered)
     W = pad + cols * (cell_w + pad)
-    H = title_h + rows * (cell_h + cap + pad) + pad
+    # Settings header strip height. The strip is centred within the W-wide
+    # canvas; if it was rendered at a different width we resize it down.
+    header_resized = None
+    header_h = 0
+    if header is not None:
+        if header.width != W:
+            header_h = max(1, int(round(header.height * W / header.width)))
+            header_resized = header.resize((W, header_h), Image.LANCZOS)
+        else:
+            header_resized = header
+            header_h = header.height
+        header_h += pad         # gap between header strip and first row
+    H = header_h + title_h + rows * (cell_h + cap + pad) + pad
     canvas = Image.new("RGB", (W, H), (255, 255, 255))
+    if header_resized is not None:
+        canvas.paste(header_resized, (0, 0))
     d = ImageDraw.Draw(canvas)
     lf, sf = _oswald_font(22, "SemiBold"), _load_font(15)
     note_max_w = cell_w - 2 * inset
@@ -2699,7 +3309,7 @@ def _compose_contact_sheet(panels, metrics, recommended, cell_w=480):
     for i, (name, rgb) in enumerate(rendered):
         r, c = divmod(i, cols)
         x = pad + c * (cell_w + pad)
-        y = title_h + r * (cell_h + cap + pad)
+        y = header_h + title_h + r * (cell_h + cap + pad)
         m = metrics.get(name, {})
         is_orig = bool(m.get("original"))
         is_rec = (name == recommended) and not is_orig
@@ -2710,9 +3320,16 @@ def _compose_contact_sheet(panels, metrics, recommended, cell_w=480):
         else:
             header = (228, 228, 228)
         d.rectangle([x, y, x + cell_w, y + cap], fill=header)
-        label_text = (m.get("label", name.upper()) if is_orig
-                      else name.upper() + ("   >> RECOMMENDED <<" if is_rec
-                                           else ""))
+        # Cell heading: prefer the per-panel `label` from metrics (it's
+        # already formatted — e.g. "DEFAULT FAX (Otsu)", "Green noise (AM-FM)"),
+        # and only fall back to an uppercased panel-key when no label is set.
+        # The ">> RECOMMENDED <<" suffix is appended only when the cell isn't
+        # ALREADY a "RECOMMENDED (auto-pick)" label, otherwise it doubles up.
+        base_label = m.get("label") or name.upper()
+        if is_rec and "RECOMMENDED" not in base_label.upper():
+            label_text = f"{base_label}   >> RECOMMENDED <<"
+        else:
+            label_text = base_label
         # Label rarely needs wrapping but keep the guard so an unusually long
         # method name (e.g. "FLOYD-STEINBERG   >> RECOMMENDED <<") doesn't
         # bleed into the next cell either.
@@ -2735,69 +3352,45 @@ def _compose_contact_sheet(panels, metrics, recommended, cell_w=480):
 
 def render_comparison(in_pdf: str, page_no: int, out_png: str, opt: FaxOptions,
                       methods=None, include_original: bool = False) -> dict:
-    """Render one page through several halftone methods into a single contact
-    sheet, annotated with per-method G4 size + transmission estimate and a
-    recommended pick, so a human can choose the optimal one by eye ("eye
-    tokens"). Returns a dict of metrics + recommendation.
+    """[LEGACY] Render one page through several halftone methods into a
+    single contact sheet so a human can pick by eye ("eye tokens").
 
-    With include_original, two reference panels are shown first — the original in
-    color (#1) and a true grayscale of it (#2) — and the default method set drops
-    to four halftones so the sheet stays a clean 6-up. The references are not
-    themselves faxes; they show the continuous-tone input each halftone (and the
-    1-bit channel) has to approximate."""
+    Now a thin shim over `render_contact_sheet`. New code should call
+    `render_contact_sheet(in_pdf, page_no, out_png, opt,
+                          include=["orig","gray", ...halftones...])`
+    directly; this wrapper exists so existing imports keep working.
+
+    Maps the legacy args to the unified call:
+      - `methods` default → curated 6-up (`COMPARE_METHODS`) when no
+        references, or 4-up (`COMPARE4_METHODS`) when references are
+        included, matching the old behaviour
+      - `include_original=True` prepends "orig" + "gray" to the recipe
+
+    Returns the same dict shape as before so legacy callers keep
+    working (`page`, `methods`, `recommended`, `reason`, `smallest`,
+    `output`).
+    """
     if methods is None:
         methods = COMPARE4_METHODS if include_original else COMPARE_METHODS
-    hdpi, vdpi = RESOLUTIONS[opt.resolution]
-    doc = fitz.open(in_pdf)
-    page = doc[page_no - 1]
-    (gray, mask, photo_fraction, _warn, already, _di, _ii,
-     text_black, text_white, eff_dpi) = _prepare_page(page, opt)
-
-    tmpdir = tempfile.mkdtemp(prefix="faxcmp_")
-    panels, metrics = [], {}
-    if include_original:
-        color = render_page_color(page, hdpi, vdpi, opt.max_scanline_px)
-        panels.append(("original", Image.fromarray(color, "RGB")))
-        metrics["original"] = {
-            "encoded_bytes": 0, "est_transmission_s": 0.0, "original": True,
-            "label": "ORIGINAL (color)", "note": "color source \u00b7 not a fax",
-            "info": "The original document in color, for reference.",
-        }
-        gray_ref = render_page_gray(page, hdpi, vdpi, opt.max_scanline_px)
-        panels.append(("grayscale", Image.fromarray(gray_ref).convert("L")))
-        metrics["grayscale"] = {
-            "encoded_bytes": 0, "est_transmission_s": 0.0, "original": True,
-            "label": "TRUE GRAYSCALE", "note": "grayscale source \u00b7 not a fax",
-            "info": "True grayscale (desaturated) source — the continuous-tone "
-                    "input each halftone below approximates.",
-        }
-    for m in methods:
-        bw = _postclean(_apply_dither(gray, mask, m, opt, eff_dpi, eff_dpi,
-                                      text_black=text_black,
-                                      text_white=text_white), opt)
-        img = Image.fromarray(bw.astype(np.uint8)).convert("1")
-        tp = os.path.join(tmpdir, f"{m}.tif")
-        nbytes = encode_g4_tiff(img, tp)
-        metrics[m] = {
-            "encoded_bytes": nbytes,
-            "est_transmission_s": round(
-                nbytes * 8 / opt.line_rate_bps + opt.page_overhead_s, 1),
-            "info": HALFTONE_INFO.get(DITHER_ALIASES.get(m, m), ""),
-        }
-        panels.append((m, img))
-
-    rec, reason = recommend_dither(photo_fraction, opt.fax_heavy, eff_dpi)
-    if rec not in methods:  # ensure the recommended panel is shown/highlighted
-        rec = min(methods, key=lambda k: metrics[k]["encoded_bytes"])
-    _compose_contact_sheet(panels, metrics, rec).save(out_png)
-    smallest = min(methods, key=lambda k: metrics[k]["encoded_bytes"])
+    include = (["orig", "gray"] if include_original else []) + list(methods)
+    result = render_contact_sheet(in_pdf, page_no, out_png, opt,
+                                  include=include)
+    # Build the legacy return shape: filter out the reference panels and
+    # surface the per-method G4 stats under "methods" (not "panels"), and
+    # carry the auto-pick recommendation through.
+    methods_metrics = {k: v for k, v in result.get("panels", {}).items()
+                       if not v.get("original")}
+    smallest = result.get("smallest")
+    rec = result.get("recommended")
+    if rec not in methods_metrics:
+        # Auto-pick wasn't in the user's method list — fall back to
+        # smallest, matching the historical behaviour exactly.
+        rec = smallest
     return {
         "page": page_no,
-        "already_bilevel": already,
-        "photo_fraction": round(photo_fraction, 4),
-        "methods": metrics,
+        "methods": methods_metrics,
         "recommended": rec,
-        "reason": reason,
+        "reason": result.get("reason"),
         "smallest": smallest,
         "output": out_png,
     }

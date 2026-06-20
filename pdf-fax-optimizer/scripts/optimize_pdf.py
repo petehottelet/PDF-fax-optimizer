@@ -163,13 +163,34 @@ def main():
                         "compositing layer so a stroke backing isn't needed)")
     p.add_argument("--recover-text-preview", type=int, default=None,
                    dest="recover_text_preview", metavar="PAGE",
-                   help="write a before/after contact sheet for PAGE showing the "
-                        "page faxed WITHOUT vs WITH within-image recover-text recolor")
+                   help="(legacy) write a before/after contact sheet for PAGE "
+                        "showing the page faxed WITHOUT vs WITH within-image "
+                        "recover-text recolor. Equivalent to "
+                        "--sample PAGE --sample-include no_recover,with_recover")
     p.add_argument("--sample", type=int, default=None, metavar="PAGE",
-                   help="write a 4-panel sample sheet for PAGE — original colour, "
-                        "grayscale, halftone-on-image-areas, and full pipeline "
-                        "(recover-text on) — so the recolour and halftone effects "
-                        "can be inspected side by side")
+                   help="write a labeled contact sheet for PAGE so the user can "
+                        "confirm the output is legible before sending. Default "
+                        "is a 4-panel sheet (original / grayscale / default-fax "
+                        "Otsu / auto-recommended). Use --panels to ask for more "
+                        "(or fewer); the sheet carries a settings header that "
+                        "documents which options produced it")
+    p.add_argument("--panels", default=None, metavar="K",
+                   help="how many panels --sample emits: one of "
+                        "1, 2, 4 (default), 6, 8, 12, 20, or 'max' (=20). "
+                        "Higher counts add more halftone screens for "
+                        "side-by-side comparison; 20 is the full SCREENS "
+                        "catalogue (every dither in the registry) on YOUR "
+                        "input page")
+    p.add_argument("--sample-include", default=None, metavar="LIST",
+                   help="comma-separated list of panel content keys for a "
+                        "custom --sample recipe (overrides --panels). Keys: "
+                        "orig, gray, default_fax, optimized, recommended, or "
+                        "any dither name including screen-{square,diamond,"
+                        "ellipse}. Example: orig,gray,clustered,floyd,line")
+    p.add_argument("--no-sample-header", dest="sample_header",
+                   action="store_false", default=True,
+                   help="omit the 3-line settings-header strip at the top "
+                        "of --sample output (default: header is shown)")
     p.add_argument("--ocr-text", choices=["off", "auto", "on"], default=None,
                    dest="ocr_text",
                    help="Within the OCR pass, control whether OUTSIDE-image "
@@ -211,16 +232,26 @@ def main():
                    default=None)
     p.add_argument("--format", choices=["pdf", "tiff"], default=None)
     p.add_argument("--line-rate", type=int, default=None)
-    p.add_argument("--preview-page", type=int, default=None)
+    p.add_argument("--preview-page", type=int, default=None,
+                   help="(legacy) write a bare grayscale PNG of the bilevel "
+                        "output for PAGE \u2014 no labels, no header. Use "
+                        "--sample PAGE --panels 1 for a labelled version")
     p.add_argument("--compare-page", type=int, default=None,
-                   help="render this page through several halftone methods into "
-                        "one labeled contact sheet so you can pick by eye")
+                   help="(legacy) render this page through several halftone "
+                        "methods into one labeled contact sheet. Equivalent to "
+                        "--sample PAGE --panels 6 (--panels 8 with "
+                        "--compare-original)")
     p.add_argument("--compare-methods", default=None,
-                   help="comma-separated halftone names for --compare-page "
-                        "(default: the curated 6-up set)")
+                   help="(legacy) comma-separated halftone names for "
+                        "--compare-page (default: the curated 6-up set). Use "
+                        "--sample-include for a custom recipe with the new "
+                        "unified --sample flag")
     p.add_argument("--compare-original", action="store_true",
-                   help="lead the contact sheet with original-color (#1) and "
-                        "true-grayscale (#2) references, then four halftones (6-up)")
+                   help="(legacy) lead the contact sheet with original-color "
+                        "(#1) and true-grayscale (#2) references, then four "
+                        "halftones (6-up). Equivalent to "
+                        "--sample PAGE --sample-include "
+                        "orig,gray,clustered,green-noise,blue-noise,line")
     p.add_argument("--keep-converted-pdf", action="store_true",
                    help="when input is Office/image, keep the intermediate PDF "
                         "next to the output instead of deleting it")
@@ -303,18 +334,47 @@ def main():
               f"recoloured white: {rt.get('words_recolored_white', 0)}")
 
     if args.sample:
+        # Resolve --panels: missing = 4 (default); "max" alias = 20; else
+        # parse as int and validate against PANEL_RECIPES.
+        valid_counts = sorted(fax.PANEL_RECIPES.keys())
+        if args.sample_include:
+            include = [k.strip() for k in args.sample_include.split(",")
+                       if k.strip()]
+            panel_count = len(include)
+        else:
+            include = None
+            raw = args.panels
+            if raw is None:
+                panel_count = 4
+            elif str(raw).lower() in ("max", "all"):
+                panel_count = max(valid_counts)
+            else:
+                try:
+                    panel_count = int(raw)
+                except (TypeError, ValueError):
+                    raise SystemExit(
+                        f"--panels: invalid value {raw!r}; expected one of "
+                        f"{valid_counts + ['max']}")
+                if panel_count not in valid_counts:
+                    raise SystemExit(
+                        f"--panels {panel_count}: not one of {valid_counts} "
+                        "(use --sample-include for a custom recipe)")
         png = os.path.splitext(args.output)[0] + f".sample_p{args.sample}.png"
-        spl = fax.render_sample(src_pdf, args.sample, png, opt)
-        rt = spl.get("recover_text") or {}
-        di = spl.get("doc_text") or {}
-        print(f"4-panel sample: {png}")
-        if di.get("words"):
-            print(f"  document text: {len(di['words'])} word(s) recoloured by "
-                  "#808080")
-        if rt.get("words"):
-            print(f"  image text:    {rt.get('words_recolored_black', 0)} black + "
-                  f"{rt.get('words_recolored_white', 0)} white "
-                  "by #808080")
+        spl = fax.render_contact_sheet(
+            src_pdf, args.sample, png, opt,
+            panel_count=panel_count, include=include,
+            show_header=getattr(args, "sample_header", True))
+        n = spl.get("panel_count", panel_count)
+        rec = spl.get("recommended")
+        reason = spl.get("reason") or ""
+        smallest = spl.get("smallest")
+        print(f"{n}-panel contact sheet: {png}")
+        if rec:
+            print(f"  auto-pick: {rec}" + (f" \u2014 {reason}" if reason else ""))
+        if smallest and smallest != rec:
+            sm = spl["panels"].get(smallest, {})
+            kb = sm.get("encoded_bytes", 0) / 1024
+            print(f"  smallest G4: {smallest} ({kb:.0f} KB)")
 
     def _progress(i, n, rep):
         # One line per page, flushed immediately, so a long deck doesn't go
