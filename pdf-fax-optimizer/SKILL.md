@@ -98,7 +98,7 @@ Run it:
 
 ```bash
 python3 -m pdf_fax_optimizer.optimize_pdf INPUT.pdf -o OUTPUT.pdf \
-    --sample 1 --report OUTPUT.report.json     # superfine + OCR by default
+    --sample 1 --report OUTPUT.report.json     # superfine + preserve_text; OCR recover_text is opt-in
 ```
 
 ### Input: PDF, Office, or image
