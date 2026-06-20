@@ -394,7 +394,8 @@ fax pipeline:
 - **PDF** — used as-is
 
 ```bash
-# Fax a Word doc directly (defaults: superfine + OCR-driven #808080 polarity)
+# Fax a Word doc directly (defaults: superfine + preserve_text;
+# OCR-driven #808080 polarity is opt-in via --recover-text on)
 pdf-fax-optimizer proposal.docx -o proposal.fax.pdf
 
 # Fax a scanned image with a 4-panel sample sheet
