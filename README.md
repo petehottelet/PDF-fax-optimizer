@@ -561,7 +561,8 @@ After `pip install pdf-fax-optimizer` it's a normal CLI (or run
 `python -m pdf_fax_optimizer.optimize_pdf …` straight from a source checkout):
 
 ```bash
-# Make a PDF faxable (default: superfine, native res, OCR + #808080 on)
+# Make a PDF faxable (defaults: superfine quality, native res, preserve_text on;
+# recover_text OCR / #808080 recolor is opt-in via --recover-text on)
 pdf-fax-optimizer input.pdf -o output.fax.pdf \
     --report output.report.json --sample 1
 
